@@ -78,9 +78,9 @@ public class FileTool {
         File driver = null;
         try {
             ZipFile zipFile = new ZipFile(source);
-            Enumeration emu = zipFile.entries();
+            Enumeration<? extends ZipEntry> emu = zipFile.entries();
             while (emu.hasMoreElements()) {
-                ZipEntry entry = (ZipEntry) emu.nextElement();
+                ZipEntry entry = emu.nextElement();
                 BufferedInputStream bis = new BufferedInputStream(zipFile.getInputStream(entry));
                 // >=115之后的版本，entry.name字段有变更，带上了系统类型
                 final String targetFileName = greaterThen114 ?

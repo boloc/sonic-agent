@@ -22,6 +22,7 @@ import com.alibaba.fastjson.JSONObject;
 import jakarta.websocket.Session;
 import lombok.extern.slf4j.Slf4j;
 import org.cloud.sonic.agent.common.maps.GlobalProcessMap;
+import org.cloud.sonic.agent.common.maps.WiFiDeviceIdMap;
 import org.cloud.sonic.agent.tests.LogUtil;
 import org.cloud.sonic.agent.tools.BytesTool;
 import org.cloud.sonic.agent.tools.PortTool;
@@ -64,7 +65,9 @@ public class AndroidSupplyTool implements ApplicationListener<ContextRefreshedEv
         sasJSON.put("isEnable", true);
         stopShare(udId);
         String processName = String.format("process-%s-sas", udId);
-        String commandLine = String.format("%s share -s %s --translate-port %d", sas, udId, port);
+        // 获取实际的设备序列号（WiFi 设备需要完整的 IP:端口）
+        String serialNumber = WiFiDeviceIdMap.getSerialNumber(udId);
+        String commandLine = String.format("%s share -s %s --translate-port %d", sas, serialNumber, port);
         try {
             Process ps = executeCommand(commandLine);
             GlobalProcessMap.getMap().put(processName, ps);
@@ -116,7 +119,9 @@ public class AndroidSupplyTool implements ApplicationListener<ContextRefreshedEv
     public static void startPerfmon(String udId, String pkg, Session session, LogUtil logUtil, int interval) {
         stopPerfmon(udId); // 启动前先停止已有监控
         String processName = String.format("process-%s-perfmon", udId);
-        String commandLine = String.format("%s perfmon -s %s -r %d %s -j --sys-cpu --sys-mem --sys-network", sas, udId, interval, pkg.isEmpty() ? "" : "--proc-cpu --proc-fps --proc-mem --proc-threads -p " + pkg);
+        // 获取实际的设备序列号（WiFi 设备需要完整的 IP:端口）
+        String serialNumber = WiFiDeviceIdMap.getSerialNumber(udId);
+        String commandLine = String.format("%s perfmon -s %s -r %d %s -j --sys-cpu --sys-mem --sys-network", sas, serialNumber, interval, pkg.isEmpty() ? "" : "--proc-cpu --proc-fps --proc-mem --proc-threads -p " + pkg);
 
         try {
             Process ps = executeCommand(commandLine);
@@ -163,8 +168,8 @@ public class AndroidSupplyTool implements ApplicationListener<ContextRefreshedEv
     }
 
     private static void printProcessOutput(Process process) {
-        // 创建线程打印标准输出
-        new Thread(() -> {
+        // 创建守护线程打印标准输出
+        Thread stdOutThread = new Thread(() -> {
             try (BufferedReader stdInput = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
                 while ((line = stdInput.readLine()) != null) {
@@ -176,10 +181,12 @@ public class AndroidSupplyTool implements ApplicationListener<ContextRefreshedEv
                     log.error("Error reading standard output", e);
                 }
             }
-        }).start();
+        });
+        stdOutThread.setDaemon(true);
+        stdOutThread.start();
 
-        // 创建线程打印错误输出
-        new Thread(() -> {
+        // 创建守护线程打印错误输出
+        Thread stdErrThread = new Thread(() -> {
             try (BufferedReader stdError = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
                 String line;
                 while ((line = stdError.readLine()) != null) {
@@ -191,7 +198,9 @@ public class AndroidSupplyTool implements ApplicationListener<ContextRefreshedEv
                     log.error("Error reading error output", e);
                 }
             }
-        }).start();
+        });
+        stdErrThread.setDaemon(true);
+        stdErrThread.start();
     }
 
     private static void processPerfmonLine(String line, Session session, LogUtil logUtil) {

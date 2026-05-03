@@ -69,11 +69,12 @@ public class MockStepDebugTest {
 
     private JSONObject getMockTestData(String fileName) throws IOException {
 //        System.out.println(this.getClass().getResource("/"+ileName).getPath());
-        BufferedReader in = new BufferedReader(new FileReader(this.getClass().getResource("/" + fileName).getPath()));
         StringBuilder jsonStr = new StringBuilder();
-        String str;
-        while ((str = in.readLine()) != null) {
-            jsonStr.append(str);
+        try (BufferedReader in = new BufferedReader(new FileReader(this.getClass().getResource("/" + fileName).getPath()))) {
+            String str;
+            while ((str = in.readLine()) != null) {
+                jsonStr.append(str);
+            }
         }
         return JSONObject.parseObject(jsonStr.toString());
     }

@@ -18,25 +18,18 @@
 package org.cloud.sonic.agent.bridge.android;
 
 import com.alibaba.fastjson.JSONObject;
+import com.android.ddmlib.IDevice;
 import org.cloud.sonic.agent.common.interfaces.DeviceStatus;
 import org.cloud.sonic.agent.common.maps.AndroidDeviceManagerMap;
+import org.cloud.sonic.agent.common.maps.WiFiDeviceIdMap;
+import org.cloud.sonic.agent.tests.TaskManager;
 import org.cloud.sonic.agent.transport.TransportWorker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * @author ZhouYiXun
- * @des 本地自定义的状态变更，不是通过adb的变更
- * @date 2021/08/16 19:26
- */
 public class AndroidDeviceLocalStatus {
+    private static final Logger log = LoggerFactory.getLogger(AndroidDeviceLocalStatus.class);
 
-    /**
-     * @param udId
-     * @param status
-     * @return void
-     * @author ZhouYiXun
-     * @des 发送状态变更消息
-     * @date 2021/8/16 20:56
-     */
     public static void send(String udId, String status) {
         JSONObject deviceDetail = new JSONObject();
         deviceDetail.put("msg", "deviceDetail");
@@ -45,70 +38,78 @@ public class AndroidDeviceLocalStatus {
         TransportWorker.send(deviceDetail);
     }
 
-    /**
-     * @param udId
-     * @return void
-     * @author ZhouYiXun
-     * @des 开始测试
-     * @date 2021/8/16 20:57
-     */
     public static boolean startTest(String udId) {
         synchronized (AndroidDeviceLocalStatus.class) {
-            if (AndroidDeviceManagerMap.getStatusMap().get(udId) == null) {
-                send(udId, DeviceStatus.TESTING);
-                AndroidDeviceManagerMap.getStatusMap().put(udId, DeviceStatus.TESTING);
+            String status = AndroidDeviceManagerMap.getStatusMap().get(udId);
+            if (status == null) {
+                markTesting(udId);
                 return true;
-            } else {
-                return false;
             }
+
+            if (DeviceStatus.TESTING.equals(status) && !TaskManager.udIdRunning(udId)) {
+                log.warn("Clear stale TESTING status before starting test, udId={}", udId);
+                clearStatus(udId);
+                markTesting(udId);
+                return true;
+            }
+            return false;
         }
     }
 
-    /**
-     * @param udId
-     * @return void
-     * @author ZhouYiXun
-     * @des 开始调试
-     * @date 2021/8/16 20:57
-     */
     public static void startDebug(String udId) {
         send(udId, DeviceStatus.DEBUGGING);
         AndroidDeviceManagerMap.getStatusMap().put(udId, DeviceStatus.DEBUGGING);
     }
 
-    /**
-     * @param udId
-     * @return void
-     * @author ZhouYiXun
-     * @des 使用完毕
-     * @date 2021/8/16 19:47
-     */
     public static void finish(String udId) {
-        if (AndroidDeviceBridgeTool.getIDeviceByUdId(udId) != null
-                && AndroidDeviceManagerMap.getStatusMap().get(udId) != null) {
-            if (AndroidDeviceManagerMap.getStatusMap().get(udId).equals(DeviceStatus.DEBUGGING)
-                    || AndroidDeviceManagerMap.getStatusMap().get(udId).equals(DeviceStatus.TESTING)) {
+        if (AndroidDeviceBridgeTool.getIDeviceByUdId(udId) != null) {
+            String status = AndroidDeviceManagerMap.getStatusMap().get(udId);
+            if (DeviceStatus.DEBUGGING.equals(status) || DeviceStatus.TESTING.equals(status)) {
                 send(udId, DeviceStatus.ONLINE);
             }
         }
-        AndroidDeviceManagerMap.getStatusMap().remove(udId);
+        clearStatus(udId);
     }
 
-    /**
-     * @param udId
-     * @return void
-     * @author ZhouYiXun
-     * @des 使用完毕异常
-     * @date 2021/8/16 19:47
-     */
     public static void finishError(String udId) {
-        if (AndroidDeviceBridgeTool.getIDeviceByUdId(udId) != null
-                && AndroidDeviceManagerMap.getStatusMap().get(udId) != null) {
-            if (AndroidDeviceManagerMap.getStatusMap().get(udId).equals(DeviceStatus.DEBUGGING)
-                    || AndroidDeviceManagerMap.getStatusMap().get(udId).equals(DeviceStatus.TESTING)) {
+        if (AndroidDeviceBridgeTool.getIDeviceByUdId(udId) != null) {
+            String status = AndroidDeviceManagerMap.getStatusMap().get(udId);
+            if (DeviceStatus.DEBUGGING.equals(status) || DeviceStatus.TESTING.equals(status)) {
                 send(udId, DeviceStatus.ERROR);
             }
         }
+        clearStatus(udId);
+        scheduleDeviceRecovery(udId);
+    }
+
+    private static void markTesting(String udId) {
+        send(udId, DeviceStatus.TESTING);
+        AndroidDeviceManagerMap.getStatusMap().put(udId, DeviceStatus.TESTING);
+    }
+
+    private static void clearStatus(String udId) {
         AndroidDeviceManagerMap.getStatusMap().remove(udId);
+        String serialNumber = WiFiDeviceIdMap.getSerialNumber(udId);
+        if (!udId.equals(serialNumber)) {
+            AndroidDeviceManagerMap.getStatusMap().remove(serialNumber);
+        }
+    }
+
+    private static void scheduleDeviceRecovery(String udId) {
+        AndroidDeviceThreadPool.cachedThreadPool.execute(() -> {
+            try {
+                Thread.sleep(5000);
+
+                if (AndroidDeviceManagerMap.getStatusMap().get(udId) == null) {
+                    IDevice device = AndroidDeviceBridgeTool.getIDeviceByUdId(udId);
+                    if (device != null && device.getState() == IDevice.DeviceState.ONLINE) {
+                        send(udId, DeviceStatus.ONLINE);
+                        log.info("Device {} auto-recovered from ERROR to ONLINE", udId);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
     }
 }

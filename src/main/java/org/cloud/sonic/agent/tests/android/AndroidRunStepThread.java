@@ -60,22 +60,25 @@ public class AndroidRunStepThread extends RunStepThread {
 
     @Override
     public void run() {
-        StepHandlers stepHandlers = SpringTool.getBean(StepHandlers.class);
-        JSONObject jsonObject = androidTestTaskBootThread.getJsonObject();
-        List<JSONObject> steps = jsonObject.getJSONArray("steps").toJavaList(JSONObject.class);
+        try {
+            StepHandlers stepHandlers = SpringTool.getBean(StepHandlers.class);
+            JSONObject jsonObject = androidTestTaskBootThread.getJsonObject();
+            List<JSONObject> steps = jsonObject.getJSONArray("steps").toJavaList(JSONObject.class);
 
-        HandleContext handleContext = new HandleContext();
-        for (JSONObject step : steps) {
-            if (isStopped()) {
-                return;
+            HandleContext handleContext = new HandleContext();
+            for (JSONObject step : steps) {
+                if (isStopped()) {
+                    return;
+                }
+                try {
+                    stepHandlers.runStep(step, handleContext, this);
+                } catch (Throwable e) {
+                    e.printStackTrace();
+                    break;
+                }
             }
-            try {
-                stepHandlers.runStep(step, handleContext, this);
-            } catch (Throwable e) {
-                e.printStackTrace();
-                break;
-            }
+        } finally {
+            setStopped(true);
         }
-
     }
 }

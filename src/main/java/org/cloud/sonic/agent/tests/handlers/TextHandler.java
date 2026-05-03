@@ -27,7 +27,53 @@ import java.util.Random;
  * @author Eason
  */
 public class TextHandler {
+
+    /**
+     * 将普通文本转换为正则表达式，在每个字符之间插入 .*
+     * 用于忽略不可见字符（如软连字符、零宽空格等）的匹配
+     * 例如：91台湾版 -> 9.*1.*台.*湾.*版
+     */
+    public static String toFuzzyRegex(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            // 转义正则表达式中的特殊字符
+            if ("\\[]{}()^$.|*+?".indexOf(c) >= 0) {
+                sb.append("\\").append(c);
+            } else {
+                sb.append(c);
+            }
+            // 在每个字符之间插入 .* 以匹配任意不可见字符
+            if (i < text.length() - 1) {
+                sb.append(".*");
+            }
+        }
+        return sb.toString();
+    }
+
     public static String replaceTrans(String text, JSONObject globalParams) {
+        // 防止 globalParams 为 null 导致替换失败
+        if (globalParams == null) {
+            globalParams = new JSONObject();
+        }
+
+        // 处理 {{regex:变量名}} 语法，将变量值转换为模糊匹配的正则表达式
+        while (text.contains("{{regex:") && text.contains("}}")) {
+            int start = text.indexOf("{{regex:");
+            int end = text.indexOf("}}", start);
+            if (end > start) {
+                String varName = text.substring(start + 8, end);
+                String varValue = globalParams.getString(varName);
+                String replacement = (varValue != null) ? toFuzzyRegex(varValue) : "";
+                text = text.substring(0, start) + replacement + text.substring(end + 2);
+            } else {
+                break;
+            }
+        }
+
         if (text.contains("{{random}}")) {
             String random = (int) (Math.random() * 10 + Math.random() * 10 * 2) + 5 + "";
             text = text.replace("{{random}}", random);

@@ -37,6 +37,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -44,6 +45,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * @author ZhouYiXun
@@ -75,6 +78,14 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
         session.getUserProperties().put("udId", udId);
         session.getUserProperties().put("id", String.format("%s-%s", this.getClass().getSimpleName(), udId));
         WebSocketSessionMap.addSession(session);
+        if (iDevice == null) {
+            log.info("Target device is not connecting, please check the connection.");
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
+            return;
+        }
         saveUdIdMapAndSet(session, iDevice);
 
         String username = iDevice.getProperty("ro.product.device");
@@ -127,14 +138,24 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
         log.info("{} send: {}", session.getUserProperties().get("id").toString(), msg);
         switch (msg.getString("type")) {
             case "appList": {
-                startService(udIdMap.get(session), session);
+                IDevice device = udIdMap.get(session);
+                // 优先使用 sonic-android-apk 获取应用列表（支持 Android 16）
+                // 只有在 APK 连接失败时才使用 ADB fallback
+                startService(device, session);
                 if (outputStreamMap.get(session) != null) {
                     try {
                         outputStreamMap.get(session).write("action_get_all_app_info".getBytes(StandardCharsets.UTF_8));
                         outputStreamMap.get(session).flush();
                     } catch (IOException e) {
                         e.printStackTrace();
+                        // Fallback to adb on error
+                        log.info("sonic-android-apk failed, using adb fallback for app list");
+                        getAppListViaAdb(device, session);
                     }
+                } else {
+                    // Fallback: use adb to get app list when sonic-android-apk socket is not available
+                    log.info("sonic-android-apk not available, using adb fallback for app list");
+                    getAppListViaAdb(device, session);
                 }
                 break;
             }
@@ -269,25 +290,37 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
     private void exit(Session session) {
         synchronized (session) {
             ScheduledFuture<?> future = (ScheduledFuture<?>) session.getUserProperties().get("schedule");
-            future.cancel(true);
-            WebSocketSessionMap.removeSession(session);
+            if (future != null) {
+                try {
+                    future.cancel(true);
+                } catch (Exception ignored) {
+                }
+            }
+            try {
+                WebSocketSessionMap.removeSession(session);
+            } catch (Exception ignored) {
+            }
             removeUdIdMapAndSet(session);
             Future<?> cmd = terminalMap.get(session);
-            if (!cmd.isDone() || !cmd.isCancelled()) {
-                try {
-                    cmd.cancel(true);
-                } catch (Exception e) {
-                    log.error(e.getMessage());
+            if (cmd != null) {
+                if (!cmd.isDone() || !cmd.isCancelled()) {
+                    try {
+                        cmd.cancel(true);
+                    } catch (Exception e) {
+                        log.error(e.getMessage());
+                    }
                 }
             }
             stopService(session);
             terminalMap.remove(session);
             Future<?> logcat = logcatMap.get(session);
-            if (!logcat.isDone() || !logcat.isCancelled()) {
-                try {
-                    logcat.cancel(true);
-                } catch (Exception e) {
-                    log.error(e.getMessage());
+            if (logcat != null) {
+                if (!logcat.isDone() || !logcat.isCancelled()) {
+                    try {
+                        logcat.cancel(true);
+                    } catch (Exception e) {
+                        log.error(e.getMessage());
+                    }
                 }
             }
             logcatMap.remove(session);
@@ -297,13 +330,20 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            log.info("{} : quit.", session.getUserProperties().get("id").toString());
+            Object idObj = session.getUserProperties().get("id");
+            log.info("{} : quit.", idObj == null ? session.getId() : idObj.toString());
         }
     }
 
     public void startService(IDevice iDevice, Session session) {
         if (socketMap.get(session) != null && socketMap.get(session).isAlive()) {
             return;
+        }
+        // Ensure sonic-android-apk service is started before we forward/connect.
+        // Otherwise the forwarded tcp port (2334) may accept then immediately close, causing adb fallback.
+        try {
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "am start -n org.cloud.sonic.android/.SonicServiceActivity");
+        } catch (Exception ignored) {
         }
         try {
             Thread.sleep(2500);
@@ -319,7 +359,26 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
             InputStreamReader isr = null;
             BufferedReader br = null;
             try {
-                managerSocket = new Socket("localhost", managerPort);
+                // On some ROMs/devices, the forwarded service may start slowly. Retry connect for a while.
+                managerSocket = new Socket();
+                boolean connected = false;
+                for (int i = 0; i < 20; i++) { // ~10s
+                    try {
+                        managerSocket.connect(new InetSocketAddress("127.0.0.1", managerPort), 1200);
+                        connected = true;
+                        break;
+                    } catch (IOException ignored) {
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+                }
+                if (!connected) {
+                    log.info("error: failed to connect sonic-android-apk service on localhost:{}", managerPort);
+                    return;
+                }
                 inputStream = managerSocket.getInputStream();
                 outputStream = managerSocket.getOutputStream();
                 outputStreamMap.put(session, outputStream);
@@ -429,4 +488,133 @@ public class AndroidTerminalWSServer implements IAndroidWSServer {
         }
         socketMap.remove(session);
     }
+
+    /**
+     * Fallback method to get app list via adb when sonic-android-apk is not available
+     * This is useful for Android 16+ where sonic-android-apk may crash
+     */
+    private void getAppListViaAdb(IDevice iDevice, Session session) {
+        if (iDevice == null) {
+            return;
+        }
+        AndroidDeviceThreadPool.cachedThreadPool.execute(() -> {
+            try {
+                // Get list of third-party packages
+                String packages = AndroidDeviceBridgeTool.executeCommand(iDevice, "pm list packages -3");
+                String[] packageList = packages.split("\n");
+
+                for (String pkg : packageList) {
+                    if (pkg.startsWith("package:")) {
+                        String packageName = pkg.replace("package:", "").trim();
+                        if (packageName.isEmpty()) continue;
+
+                        // Get app info using dumpsys (avoid grep dependency; parse in Java)
+                        String appInfo = AndroidDeviceBridgeTool.executeCommand(iDevice, "dumpsys package " + packageName);
+
+                        String versionName = "";
+                        String versionCode = "";
+                        String appName = parseApplicationLabel(appInfo);
+                        String[] vv = parseVersionInfo(appInfo);
+                        versionName = vv[0];
+                        versionCode = vv[1];
+
+                        if (appName.isEmpty()) {
+                            // Fallback: use package name when label is unavailable
+                            log.info("App label not found via dumpsys for package: {}", packageName);
+                            appName = packageName;
+                        }
+
+                        JSONObject detail = new JSONObject();
+                        detail.put("appName", appName);
+                        detail.put("packageName", packageName);
+                        detail.put("versionName", versionName);
+                        detail.put("versionCode", versionCode);
+
+                        JSONObject appListDetail = new JSONObject();
+                        appListDetail.put("msg", "appListDetail");
+                        appListDetail.put("detail", detail);
+
+                        BytesTool.sendText(session, appListDetail.toJSONString());
+                    }
+                }
+                log.info("App list retrieved via adb for device: {}", iDevice.getSerialNumber());
+            } catch (Exception e) {
+                log.error("Failed to get app list via adb: {}", e.getMessage());
+            }
+        });
+    }
+
+    private static final Pattern VERSION_NAME_PATTERN = Pattern.compile("versionName=([^\\s]+)");
+    private static final Pattern VERSION_CODE_PATTERN = Pattern.compile("versionCode=(\\d+)");
+    private static final Pattern NON_LOCALIZED_LABEL_PATTERN = Pattern.compile("nonLocalizedLabel=([^\\s,}]+)");
+    private static final Pattern LABEL_PATTERN = Pattern.compile("\\blabel=([^\\s,}]+)");
+
+    private static String[] parseVersionInfo(String dumpsysPackage) {
+        String versionName = "";
+        String versionCode = "";
+        if (dumpsysPackage == null || dumpsysPackage.isEmpty()) {
+            return new String[]{versionName, versionCode};
+        }
+        Matcher vn = VERSION_NAME_PATTERN.matcher(dumpsysPackage);
+        if (vn.find()) {
+            versionName = vn.group(1);
+        }
+        Matcher vc = VERSION_CODE_PATTERN.matcher(dumpsysPackage);
+        if (vc.find()) {
+            versionCode = vc.group(1);
+        }
+        return new String[]{versionName, versionCode};
+    }
+
+    private static String parseApplicationLabel(String dumpsysPackage) {
+        if (dumpsysPackage == null || dumpsysPackage.isEmpty()) {
+            return "";
+        }
+        // Prefer Chinese label if present, then generic label.
+        String[] keys = new String[]{
+                "application-label-zh:",
+                "application-label-zh_CN:",
+                "application-label-zh-CN:",
+                "application-label-zh-Hans:",
+                "application-label:",
+                "application-label-en:",
+        };
+        String[] lines = dumpsysPackage.split("\n");
+        for (String key : keys) {
+            for (String raw : lines) {
+                String line = raw.trim();
+                int idx = line.indexOf(key);
+                if (idx >= 0) {
+                    String val = line.substring(idx + key.length()).trim();
+                    // dumpsys sometimes prints with quotes
+                    if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
+                        val = val.substring(1, val.length() - 1).trim();
+                    }
+                    return val;
+                }
+            }
+        }
+
+        // Some ROMs don't print application-label lines; try ApplicationInfo fields.
+        // Example: ApplicationInfo{... nonLocalizedLabel=xxx ...}
+        Matcher nl = NON_LOCALIZED_LABEL_PATTERN.matcher(dumpsysPackage);
+        if (nl.find()) {
+            return stripQuotes(nl.group(1));
+        }
+        Matcher lb = LABEL_PATTERN.matcher(dumpsysPackage);
+        if (lb.find()) {
+            return stripQuotes(lb.group(1));
+        }
+        return "";
+    }
+
+    private static String stripQuotes(String v) {
+        if (v == null) return "";
+        String val = v.trim();
+        if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
+            val = val.substring(1, val.length() - 1).trim();
+        }
+        return val;
+    }
+
 }

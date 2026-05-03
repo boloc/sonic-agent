@@ -152,10 +152,32 @@ public class IOSStepHandler {
     }
 
     public void closeIOSDriver() {
+        // 关闭 driver 的最大超时时间（秒），防止 HTTP 请求阻塞导致锁无法释放
+        final int CLOSE_DRIVER_TIMEOUT_SECONDS = 10;
+
         try {
             if (iosDriver != null) {
-                iosDriver.closeDriver();
-                log.sendStepLog(StepType.PASS, "退出连接设备", "");
+                // 使用超时包装，防止 closeDriver 阻塞过久
+                java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+                java.util.concurrent.Future<?> future = executor.submit(() -> {
+                    try {
+                        iosDriver.closeDriver();
+                    } catch (Exception e) {
+                        // 忽略关闭时的异常，仅记录日志
+                    }
+                });
+                try {
+                    future.get(CLOSE_DRIVER_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+                    log.sendStepLog(StepType.PASS, "退出连接设备", "");
+                } catch (java.util.concurrent.TimeoutException e) {
+                    future.cancel(true);
+                    log.sendStepLog(StepType.WARN, "关闭 Driver 超时，强制跳过",
+                            "closeDriver 操作超过 " + CLOSE_DRIVER_TIMEOUT_SECONDS + " 秒未响应");
+                } catch (Exception e) {
+                    log.sendStepLog(StepType.WARN, "关闭 Driver 异常", e.getMessage());
+                } finally {
+                    executor.shutdownNow();
+                }
             }
             if (pocoDriver != null) {
                 pocoDriver.closeDriver();

@@ -66,11 +66,29 @@ public class TaskManager {
     private static final Lock lock = new ReentrantLock();
 
     public static boolean ridRunning(Integer rid, String udId) {
+        clearTerminatedThread();
+        clearStaleRunningUdId(udId);
         return runningRidSet.contains(rid + "-" + udId);
     }
 
     public static boolean udIdRunning(String udId) {
+        clearTerminatedThread();
+        clearStaleRunningUdId(udId);
         return runningUdIdSet.contains(udId);
+    }
+
+    public static void clearStaleRunningUdId(String udId) {
+        if (!runningUdIdSet.contains(udId)) {
+            return;
+        }
+        boolean hasAliveBootThread = bootThreadsMap.entrySet().stream()
+                .anyMatch(t -> t.getKey().endsWith("-" + udId) && t.getValue().isAlive());
+        if (hasAliveBootThread) {
+            return;
+        }
+        logger.warn("Clear stale running task flag, udId={}", udId);
+        runningUdIdSet.remove(udId);
+        runningRidSet.removeIf(r -> r.endsWith("-" + udId));
     }
 
     /**

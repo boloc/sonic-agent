@@ -42,6 +42,7 @@ import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Component
@@ -58,13 +59,22 @@ public class AndroidScreenWSServer implements IAndroidWSServer {
     @OnOpen
     public void onOpen(Session session, @PathParam("key") String secretKey,
                        @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
+        log.info("Android screen websocket opening: udId={}, session={}", udId, session.getId());
         if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
             log.info("Auth Failed!");
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
         IDevice iDevice = AndroidDeviceBridgeTool.getIDeviceByUdId(udId);
         if (iDevice == null) {
             log.info("Target device is not connecting, please check the connection.");
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
         AndroidDeviceBridgeTool.screen(iDevice, "abort");
@@ -118,26 +128,47 @@ public class AndroidScreenWSServer implements IAndroidWSServer {
     @OnMessage
     public void onMessage(String message, Session session) {
         JSONObject msg = JSON.parseObject(message);
-        log.info("{} send: {}", session.getUserProperties().get("id").toString(), msg);
-        String udId = session.getUserProperties().get("udId").toString();
+        Object idObj = session.getUserProperties().get("id");
+        log.info("{} send: {}", idObj == null ? session.getId() : idObj.toString(), msg);
+        Object udIdObj = session.getUserProperties().get("udId");
+        if (udIdObj == null) {
+            return;
+        }
+        String udId = udIdObj.toString();
         switch (msg.getString("type")) {
             case "switch" -> {
-                typeMap.put(udId, msg.getString("detail"));
                 IDevice iDevice = udIdMap.get(session);
+                if (iDevice == null) {
+                    return;
+                }
+                typeMap.put(udId, msg.getString("detail"));
+                typeMap.put(iDevice.getSerialNumber(), msg.getString("detail"));
                 if (!androidMonitorHandler.isMonitorRunning(iDevice)) {
+                    AtomicBoolean started = new AtomicBoolean(false);
                     androidMonitorHandler.startMonitor(iDevice, res -> {
                         JSONObject rotationJson = new JSONObject();
                         rotationJson.put("msg", "rotation");
                         rotationJson.put("value", Integer.parseInt(res) * 90);
                         BytesTool.sendText(session, rotationJson.toJSONString());
-                        startScreen(session);
+                        if (started.compareAndSet(false, true)) {
+                            startScreen(session);
+                        }
                     });
+                    sendCurrentRotation(iDevice, session);
+                    if (started.compareAndSet(false, true)) {
+                        startScreen(session);
+                    }
                 } else {
+                    sendCurrentRotation(iDevice, session);
                     startScreen(session);
                 }
             }
             case "pic" -> {
                 picMap.put(udId, msg.getString("detail"));
+                IDevice iDevice = udIdMap.get(session);
+                if (iDevice != null) {
+                    picMap.put(iDevice.getSerialNumber(), msg.getString("detail"));
+                }
                 startScreen(session);
             }
         }
@@ -146,34 +177,54 @@ public class AndroidScreenWSServer implements IAndroidWSServer {
     private void startScreen(Session session) {
         IDevice iDevice = udIdMap.get(session);
         if (iDevice != null) {
+            String serialNumber = iDevice.getSerialNumber();
+            String udId = String.valueOf(session.getUserProperties().get("udId"));
+            log.info("Starting Android screen: udId={}, serialNumber={}, type={}",
+                    udId, serialNumber, getScreenType(udId, serialNumber));
             Thread old = ScreenMap.getMap().get(session);
             if (old != null) {
                 old.interrupt();
+                int waitCount = 0;
                 do {
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException e) {
                         e.printStackTrace();
                     }
+                    waitCount++;
+                    if (waitCount >= 10) {
+                        // 超时强制清理，防止无限等待
+                        log.warn("Wait for old screen thread exit timeout, force remove from ScreenMap");
+                        ScreenMap.getMap().remove(session);
+                        break;
+                    }
                 }
                 while (ScreenMap.getMap().get(session) != null);
             }
-            typeMap.putIfAbsent(iDevice.getSerialNumber(), "scrcpy");
-            switch (typeMap.get(iDevice.getSerialNumber())) {
+            typeMap.putIfAbsent(serialNumber, "scrcpy");
+            int rotation = getCurrentRotation(iDevice);
+            switch (getScreenType(udId, serialNumber)) {
                 case "scrcpy" -> {
                     ScrcpyServerUtil scrcpyServerUtil = new ScrcpyServerUtil();
-                    Thread scrcpyThread = scrcpyServerUtil.start(iDevice.getSerialNumber(), AndroidDeviceManagerMap.getRotationMap().get(iDevice.getSerialNumber()), session);
+                    Thread scrcpyThread = scrcpyServerUtil.start(serialNumber, rotation, session);
+                    if (scrcpyThread == null) {
+                        log.warn("scrcpy screen failed to start: udId={}, serialNumber={}", udId, serialNumber);
+                        sendSupportMessage(session, "scrcpy service failed to start, please check agent connectivity and scrcpy server jar version.");
+                        return;
+                    }
                     ScreenMap.getMap().put(session, scrcpyThread);
                 }
                 case "minicap" -> {
                     MiniCapUtil miniCapUtil = new MiniCapUtil();
                     AtomicReference<String[]> banner = new AtomicReference<>(new String[24]);
                     Thread miniCapThread = miniCapUtil.start(
-                            iDevice.getSerialNumber(), banner, null,
-                            picMap.get(iDevice.getSerialNumber()) == null ? "high" : picMap.get(iDevice.getSerialNumber()),
-                            AndroidDeviceManagerMap.getRotationMap().get(iDevice.getSerialNumber()), session
+                            serialNumber, banner, null,
+                            picMap.get(serialNumber) == null ? "high" : picMap.get(serialNumber),
+                            rotation, session
                     );
-                    ScreenMap.getMap().put(session, miniCapThread);
+                    if (miniCapThread != null) {
+                        ScreenMap.getMap().put(session, miniCapThread);
+                    }
                 }
             }
             JSONObject picFinish = new JSONObject();
@@ -182,26 +233,76 @@ public class AndroidScreenWSServer implements IAndroidWSServer {
         }
     }
 
+    private String getScreenType(String udId, String serialNumber) {
+        String type = typeMap.get(serialNumber);
+        if (type == null && udId != null) {
+            type = typeMap.get(udId);
+        }
+        return type == null ? "scrcpy" : type;
+    }
+
+    private int getCurrentRotation(IDevice iDevice) {
+        Integer rotation = AndroidDeviceManagerMap.getRotationMap().get(iDevice.getSerialNumber());
+        if (rotation == null) {
+            rotation = AndroidDeviceBridgeTool.getScreen(iDevice);
+            AndroidDeviceManagerMap.getRotationMap().put(iDevice.getSerialNumber(), rotation);
+        }
+        return rotation;
+    }
+
+    private void sendCurrentRotation(IDevice iDevice, Session session) {
+        int rotation = getCurrentRotation(iDevice);
+        JSONObject rotationJson = new JSONObject();
+        rotationJson.put("msg", "rotation");
+        rotationJson.put("value", rotation * 90);
+        BytesTool.sendText(session, rotationJson.toJSONString());
+    }
+
+    private void sendSupportMessage(Session session, String text) {
+        JSONObject support = new JSONObject();
+        support.put("msg", "support");
+        support.put("text", text);
+        BytesTool.sendText(session, support.toJSONString());
+    }
+
     private void exit(Session session) {
         synchronized (session) {
             ScheduledFuture<?> future = (ScheduledFuture<?>) session.getUserProperties().get("schedule");
-            future.cancel(true);
-            String udId = session.getUserProperties().get("udId").toString();
-            androidMonitorHandler.stopMonitor(udIdMap.get(session));
-            WebSocketSessionMap.removeSession(session);
-            removeUdIdMapAndSet(session);
-            AndroidDeviceManagerMap.getRotationMap().remove(udId);
-            if (ScreenMap.getMap().get(session) != null) {
-                ScreenMap.getMap().get(session).interrupt();
+            if (future != null) {
+                try {
+                    future.cancel(true);
+                } catch (Exception ignored) {
+                }
             }
-            typeMap.remove(udId);
-            picMap.remove(udId);
+            Object udIdObj = session.getUserProperties().get("udId");
+            String udId = udIdObj == null ? null : udIdObj.toString();
+            try {
+                androidMonitorHandler.stopMonitor(udIdMap.get(session));
+            } catch (Exception ignored) {
+            }
+            try {
+                WebSocketSessionMap.removeSession(session);
+            } catch (Exception ignored) {
+            }
+            removeUdIdMapAndSet(session);
+            if (udId != null) {
+                AndroidDeviceManagerMap.getRotationMap().remove(udId);
+            }
+            Thread screenThread = ScreenMap.getMap().remove(session);
+            if (screenThread != null) {
+                screenThread.interrupt();
+            }
+            if (udId != null) {
+                typeMap.remove(udId);
+                picMap.remove(udId);
+            }
             try {
                 session.close();
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            log.info("{} : quit.", session.getUserProperties().get("id").toString());
+            Object idObj = session.getUserProperties().get("id");
+            log.info("{} : quit.", idObj == null ? session.getId() : idObj.toString());
         }
     }
 }

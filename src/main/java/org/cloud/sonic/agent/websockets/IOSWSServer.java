@@ -44,7 +44,6 @@ import org.cloud.sonic.driver.common.tool.RespHandler;
 import org.cloud.sonic.driver.common.tool.SonicRespException;
 import org.cloud.sonic.driver.ios.IOSDriver;
 import org.cloud.sonic.driver.ios.enums.SystemButton;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -71,12 +70,10 @@ public class IOSWSServer implements IIOSWSServer {
     private String key;
     @Value("${sonic.agent.port}")
     private int port;
-    @Autowired
-    private AgentManagerTool agentManagerTool;
 
     @OnOpen
     public void onOpen(Session session, @PathParam("key") String secretKey,
-                       @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
+                    @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
         if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
             log.info("Auth Failed!");
             return;
@@ -88,14 +85,15 @@ public class IOSWSServer implements IIOSWSServer {
             return;
         }
         log.info("ios lock udId：{}", udId);
+        // 获取锁成功后立即写入 udId，确保 onClose 时能正确解锁
+        // 这必须在任何可能 return 的代码之前执行！
+        session.getUserProperties().put("udId", udId);
         IOSDeviceLocalStatus.startDebug(udId);
 
         if (!SibTool.getDeviceList().contains(udId)) {
             log.info("Target device is not connecting, please check the connection.");
             return;
         }
-
-        session.getUserProperties().put("udId", udId);
         session.getUserProperties().put("id", String.format("%s-%s", this.getClass().getSimpleName(), udId));
         WebSocketSessionMap.addSession(session);
         saveUdIdMapAndSet(session, udId);

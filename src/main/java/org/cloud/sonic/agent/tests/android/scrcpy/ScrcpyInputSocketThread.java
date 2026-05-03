@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.BlockingQueue;
 
 /**
@@ -60,7 +61,7 @@ public class ScrcpyInputSocketThread extends Thread {
         this.scrcpyLocalThread = scrcpyLocalThread;
         this.session = session;
         this.androidTestTaskBootThread = scrcpyLocalThread.getAndroidTestTaskBootThread();
-        this.setDaemon(false);
+        this.setDaemon(true);
         this.setName(androidTestTaskBootThread.formatThreadName(ANDROID_INPUT_SOCKET_PRE));
     }
 
@@ -84,8 +85,15 @@ public class ScrcpyInputSocketThread extends Thread {
         return session;
     }
 
+    // 增大缓冲区，减少内存分配和拷贝次数
     private static final int BUFFER_SIZE = 1024 * 1024 * 10;
-    private static final int READ_BUFFER_SIZE = 1024 * 5;
+    private static final int READ_BUFFER_SIZE = 1024 * 64;  // 64KB per read, 减少系统调用
+
+    /**
+     * If the queue is full, drop buffered frames until we meet a sync frame (IDR/SPS/PPS),
+     * so the decoder can recover quickly and latency won't grow unbounded.
+     */
+    private volatile boolean needSyncFrame = false;
 
     @Override
     public void run() {
@@ -95,13 +103,27 @@ public class ScrcpyInputSocketThread extends Thread {
         InputStream inputStream = null;
         try {
             videoSocket.connect(new InetSocketAddress("localhost", scrcpyPort));
+            // 优化 Socket 参数
+            videoSocket.setSoTimeout(5000);  // 读取超时
+            videoSocket.setTcpNoDelay(true);  // 禁用 Nagle 算法，减少延迟
+            videoSocket.setReceiveBufferSize(256 * 1024);  // 256KB 接收缓冲区
             inputStream = videoSocket.getInputStream();
             if (videoSocket.isConnected()) {
                 String sizeTotal = AndroidDeviceBridgeTool.getScreenSize(iDevice);
+                String[] sizeParts = sizeTotal.split("x");
+                int width = Integer.parseInt(sizeParts[0].trim());
+                int height = Integer.parseInt(sizeParts[1].trim());
+
+                int[] videoSize = getScrcpyVideoSize(width, height);
+                width = videoSize[0];
+                height = videoSize[1];
+
+                log.info("[scrcpy] display size: {}x{}", width, height);
+
                 JSONObject size = new JSONObject();
                 size.put("msg", "size");
-                size.put("width", sizeTotal.split("x")[0]);
-                size.put("height", sizeTotal.split("x")[1]);
+                size.put("width", width);
+                size.put("height", height);
                 BytesTool.sendText(session, size.toJSONString());
             }
             int readLength;
@@ -109,29 +131,43 @@ public class ScrcpyInputSocketThread extends Thread {
             int bufferLength = 0;
             byte[] buffer = new byte[BUFFER_SIZE];
             while (scrcpyLocalThread.isAlive()) {
-                readLength = inputStream.read(buffer, bufferLength, READ_BUFFER_SIZE);
-                if (readLength > 0) {
-                    bufferLength += readLength;
-                    for (int i = 5; i < bufferLength - 4; i++) {
-                        if (buffer[i] == 0x00 &&
-                                buffer[i + 1] == 0x00 &&
-                                buffer[i + 2] == 0x00 &&
-                                buffer[i + 3] == 0x01
-                        ) {
-                            naLuIndex = i;
-                            byte[] naluBuffer = new byte[naLuIndex];
-                            System.arraycopy(buffer, 0, naluBuffer, 0, naLuIndex);
-                            dataQueue.add(naluBuffer);
-                            bufferLength -= naLuIndex;
-                            System.arraycopy(buffer, naLuIndex, buffer, 0, bufferLength);
-                            i = 5;
+                try {
+                    readLength = inputStream.read(buffer, bufferLength, READ_BUFFER_SIZE);
+                    if (readLength > 0) {
+                        bufferLength += readLength;
+                        for (int i = 5; i < bufferLength - 4; i++) {
+                            if (buffer[i] == 0x00 &&
+                                    buffer[i + 1] == 0x00 &&
+                                    buffer[i + 2] == 0x00 &&
+                                    buffer[i + 3] == 0x01
+                            ) {
+                                naLuIndex = i;
+                                byte[] naluBuffer = new byte[naLuIndex];
+                                System.arraycopy(buffer, 0, naluBuffer, 0, naLuIndex);
+                                offerVideo(naluBuffer);
+                                bufferLength -= naLuIndex;
+                                System.arraycopy(buffer, naLuIndex, buffer, 0, bufferLength);
+                                i = 5;
+                            }
                         }
+                    } else if (readLength < 0) {
+                        // 流结束
+                        log.info("scrcpy video stream ended.");
+                        break;
                     }
+                } catch (SocketTimeoutException e) {
+                    // 读取超时，继续循环检查线程状态，避免投屏卡住
+                    log.debug("scrcpy socket read timeout, retrying...");
                 }
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            log.error("scrcpy socket error: {}", e.getMessage());
         } finally {
+            // ScreenMap 清理必须在 finally 内，确保任何异常都不会阻止清理
+            // 否则 startScreen() 中的等待循环会死锁
+            if (session != null) {
+                ScreenMap.getMap().remove(session);
+            }
             if (scrcpyLocalThread.isAlive()) {
                 scrcpyLocalThread.interrupt();
                 log.info("scrcpy thread closed.");
@@ -154,9 +190,165 @@ public class ScrcpyInputSocketThread extends Thread {
             }
         }
         AndroidDeviceBridgeTool.removeForward(iDevice, scrcpyPort, "scrcpy");
-        if (session != null) {
-            ScreenMap.getMap().remove(session);
+    }
+
+    private int[] getScrcpyVideoSize(int deviceWidth, int deviceHeight) {
+        int maxSize = scrcpyLocalThread.getMaxSize();
+        if (maxSize <= 0) {
+            return new int[]{deviceWidth, deviceHeight};
+        }
+        int longerSide = Math.max(deviceWidth, deviceHeight);
+        if (longerSide <= maxSize) {
+            return new int[]{deviceWidth, deviceHeight};
+        }
+
+        double scale = (double) maxSize / longerSide;
+        int width = toEvenSize(deviceWidth * scale);
+        int height = toEvenSize(deviceHeight * scale);
+        return new int[]{Math.max(2, width), Math.max(2, height)};
+    }
+
+    private int toEvenSize(double value) {
+        int size = (int) Math.round(value);
+        return size % 2 == 0 ? size : size - 1;
+    }
+
+    /**
+     * 最近一组完整的同步帧（SPS + PPS + IDR），用于丢帧后快速恢复解码器
+     */
+    private volatile byte[] lastSps = null;
+    private volatile byte[] lastPps = null;
+    private volatile byte[] lastIdr = null;
+    
+    private void offerVideo(byte[] naluBuffer) {
+        // 缓存同步帧，用于丢帧后恢复
+        cacheSyncFrameIfNeeded(naluBuffer);
+        
+        // When we previously dropped frames due to overload, wait for a sync frame.
+        if (needSyncFrame && !isSyncFrame(naluBuffer)) {
+            return;
+        }
+
+        // Fast path.
+        if (dataQueue.offer(naluBuffer)) {
+            needSyncFrame = false;
+            return;
+        }
+
+        // Queue is full: smart drop strategy
+        // 1. First try dropping only P-frames (non-sync frames) from queue head
+        int dropped = 0;
+        int targetDrop = Math.max(1, dataQueue.size() / 3);
+        while (dropped < targetDrop && !dataQueue.isEmpty()) {
+            byte[] head = dataQueue.peek();
+            if (head != null && !isSyncFrame(head)) {
+                dataQueue.poll();
+                dropped++;
+            } else {
+                // Hit a sync frame, stop dropping to preserve decoder state
+                break;
+            }
+        }
+        
+        // Try to offer again after dropping P-frames
+        if (dataQueue.offer(naluBuffer)) {
+            needSyncFrame = false;
+            return;
+        }
+
+        // 2. Still full, clear queue but immediately inject cached sync frames
+        dataQueue.clear();
+        
+        // Inject cached SPS/PPS/IDR to help decoder recover immediately
+        if (lastSps != null && lastPps != null && lastIdr != null) {
+            dataQueue.offer(lastSps);
+            dataQueue.offer(lastPps);
+            dataQueue.offer(lastIdr);
+            needSyncFrame = false;
+            log.debug("Queue overflow: cleared and injected cached sync frames for recovery");
+        } else {
+            needSyncFrame = true;
+            log.debug("Queue overflow: cleared, waiting for next sync frame");
+        }
+
+        // Offer current frame if it's a sync frame
+        if (isSyncFrame(naluBuffer)) {
+            dataQueue.offer(naluBuffer);
+            needSyncFrame = false;
         }
     }
-}
+    
+    /**
+     * 缓存SPS/PPS/IDR帧，用于丢帧后快速恢复
+     */
+    private void cacheSyncFrameIfNeeded(byte[] data) {
+        String codec = scrcpyLocalThread.getVideoCodec();
+        if (codec == null || codec.isBlank() || codec.equalsIgnoreCase("h264")) {
+            int type = parseH264NaluType(data);
+            switch (type) {
+                case 7 -> lastSps = data.clone();  // SPS
+                case 8 -> lastPps = data.clone();  // PPS
+                case 5 -> lastIdr = data.clone();  // IDR
+            }
+        } else if (codec.equalsIgnoreCase("h265")) {
+            int type = parseH265NaluType(data);
+            switch (type) {
+                case 33 -> lastSps = data.clone();  // SPS
+                case 34 -> lastPps = data.clone();  // PPS
+                case 19, 20 -> lastIdr = data.clone();  // IDR
+            }
+        }
+    }
 
+    private boolean isSyncFrame(byte[] data) {
+        String codec = scrcpyLocalThread.getVideoCodec();
+        // Default to h264 for safety.
+        if (codec == null || codec.isBlank() || codec.equalsIgnoreCase("h264")) {
+            int type = parseH264NaluType(data);
+            // IDR=5, SPS=7, PPS=8
+            return type == 5 || type == 7 || type == 8;
+        }
+        if (codec.equalsIgnoreCase("h265")) {
+            int type = parseH265NaluType(data);
+            // VPS=32, SPS=33, PPS=34, IDR_W_RADL=19, IDR_N_LP=20
+            return type == 32 || type == 33 || type == 34 || type == 19 || type == 20;
+        }
+        return true;
+    }
+
+    private int parseH264NaluType(byte[] data) {
+        int idx = findNaluHeaderIndex(data);
+        if (idx < 0 || idx >= data.length) {
+            return -1;
+        }
+        return data[idx] & 0x1F;
+    }
+
+    private int parseH265NaluType(byte[] data) {
+        int idx = findNaluHeaderIndex(data);
+        if (idx < 0 || idx >= data.length) {
+            return -1;
+        }
+        return (data[idx] >> 1) & 0x3F;
+    }
+
+    /**
+     * Find the first byte after Annex-B start code (0x000001 or 0x00000001).
+     */
+    private int findNaluHeaderIndex(byte[] data) {
+        if (data == null || data.length < 5) {
+            return -1;
+        }
+        for (int i = 0; i < data.length - 4; i++) {
+            // 00 00 00 01
+            if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01) {
+                return i + 4;
+            }
+            // 00 00 01
+            if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01) {
+                return i + 3;
+            }
+        }
+        return -1;
+    }
+}

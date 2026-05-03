@@ -25,11 +25,22 @@ public class WebSocketSessionMap {
     }
 
     public static void addSession(@NonNull Session session) {
-        sessionMap.put(session.getUserProperties().get("id").toString(), session);
+        Object idObj = session.getUserProperties().get("id");
+        String key = idObj == null ? session.getId() : idObj.toString();
+        if (key == null || key.isBlank()) {
+            // Best-effort: do not throw during handshake/early-close.
+            return;
+        }
+        sessionMap.put(key, session);
     }
 
     public static void removeSession(@NonNull Session session) {
-        removeSession(session.getUserProperties().get("id").toString());
+        Object idObj = session.getUserProperties().get("id");
+        String key = idObj == null ? session.getId() : idObj.toString();
+        if (key == null || key.isBlank()) {
+            return;
+        }
+        removeSession(key);
     }
 
     public static void removeSession(String sessionId) {

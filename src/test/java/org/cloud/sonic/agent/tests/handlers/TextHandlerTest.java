@@ -40,4 +40,22 @@ public class TextHandlerTest {
         s = TextHandler.replaceTrans("{{xy}}", jsonObject);
         Assert.assertEquals("1,2", s);
     }
+
+    @Test
+    public void testChineseVariableWithXpath() {
+        JSONObject jsonObject = new JSONObject();
+        jsonObject.put("产品B应用名称", "91台湾版");
+        
+        // 测试中文变量名替换
+        String s = TextHandler.replaceTrans("{{产品B应用名称}}", jsonObject);
+        Assert.assertEquals("91台湾版", s);
+        
+        // 测试带单引号的 xpath 格式（模拟实际使用场景）
+        s = TextHandler.replaceTrans("//android.widget.TextView[contains(@text,'{{产品B应用名称}}')]", jsonObject);
+        Assert.assertEquals("//android.widget.TextView[contains(@text,'91台湾版')]", s);
+        
+        // 打印结果，方便调试
+        System.out.println("替换结果: " + s);
+        System.out.println("globalParams: " + jsonObject.toJSONString());
+    }
 }

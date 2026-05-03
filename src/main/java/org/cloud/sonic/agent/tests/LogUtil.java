@@ -42,6 +42,11 @@ public class LogUtil {
     public int caseId = 0;
     public int resultId = 0;
     public String udId = "";
+    private volatile long lastSendTimeMs = System.currentTimeMillis();
+
+    public long getLastSendTimeMs() {
+        return lastSendTimeMs;
+    }
 
     /**
      * @param message
@@ -51,6 +56,7 @@ public class LogUtil {
      * @date 2021/8/16 19:57
      */
     public void send(JSONObject message) {
+        lastSendTimeMs = System.currentTimeMillis();
         //先加上消息附带信息
         message.put("cid", caseId);
         message.put("rid", resultId);

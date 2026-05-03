@@ -23,14 +23,14 @@ import com.alibaba.fastjson.JSONObject;
 import org.springframework.util.CollectionUtils;
 import org.testng.ISuite;
 import org.testng.ISuiteListener;
+import org.testng.xml.XmlTest;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 测试套件监听器
- *
- * @author JayWenStar
- * @date 2022/2/8 11:55 上午
+ * Test suite listener.
  */
 public class SuiteListener implements ISuiteListener {
 
@@ -38,38 +38,51 @@ public class SuiteListener implements ISuiteListener {
 
     @Override
     public void onStart(ISuite suite) {
-        String runningTestsMapKey = getRunningTestsMapKey(suite);
-        if (runningTestsMapKey == null || runningTestsMapKey.length() == 0) {
-            return;
+        for (String runningTestsMapKey : getRunningTestsMapKeys(suite)) {
+            runningTestsMap.put(runningTestsMapKey, true);
         }
-        runningTestsMap.put(runningTestsMapKey, true);
     }
 
     @Override
     public void onFinish(ISuite suite) {
-        String runningTestsMapKey = getRunningTestsMapKey(suite);
-        if (runningTestsMapKey == null || runningTestsMapKey.length() == 0) {
-            return;
+        for (String runningTestsMapKey : getRunningTestsMapKeys(suite)) {
+            runningTestsMap.remove(runningTestsMapKey);
         }
-        // 加上udId，避免先完成的设备移除后，后完成的设备无法执行后续操作
-        runningTestsMap.remove(runningTestsMapKey);
     }
 
-    private String getRunningTestsMapKey(ISuite suite) {
-        JSONObject dataInfoJson = JSON.parseObject(suite.getParameter("dataInfo"));
+    private List<String> getRunningTestsMapKeys(ISuite suite) {
+        List<String> keys = new ArrayList<>();
+        if (suite.getXmlSuite() != null && !CollectionUtils.isEmpty(suite.getXmlSuite().getTests())) {
+            for (XmlTest xmlTest : suite.getXmlSuite().getTests()) {
+                addRunningTestsMapKeys(keys, xmlTest.getParameter("dataInfo"));
+            }
+        }
+        if (keys.isEmpty()) {
+            addRunningTestsMapKeys(keys, suite.getParameter("dataInfo"));
+        }
+        return keys;
+    }
+
+    private void addRunningTestsMapKeys(List<String> keys, String dataInfo) {
+        if (dataInfo == null || dataInfo.length() == 0) {
+            return;
+        }
+        JSONObject dataInfoJson = JSON.parseObject(dataInfo);
         String rid = dataInfoJson.getString("rid");
         JSONArray deviceArray = dataInfoJson.getJSONArray("device");
-        if (CollectionUtils.isEmpty(deviceArray)) {
-            return null;
+        if (rid == null || rid.length() == 0 || CollectionUtils.isEmpty(deviceArray)) {
+            return;
         }
-        JSONObject jsonObject = deviceArray.getJSONObject(0);
-        if (jsonObject == null) {
-            return null;
+        for (int i = 0; i < deviceArray.size(); i++) {
+            JSONObject jsonObject = deviceArray.getJSONObject(i);
+            if (jsonObject == null) {
+                continue;
+            }
+            String udId = jsonObject.getString("udId");
+            if (udId == null || udId.length() == 0) {
+                continue;
+            }
+            keys.add(rid + "-" + udId);
         }
-        String udId = jsonObject.getString("udId");
-        if (udId == null || udId.length() == 0) {
-            return null;
-        }
-        return rid + "-" + udId;
     }
 }

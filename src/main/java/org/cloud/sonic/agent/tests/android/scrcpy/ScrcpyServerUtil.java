@@ -22,6 +22,7 @@ import jakarta.websocket.Session;
 import org.cloud.sonic.agent.bridge.android.AndroidDeviceBridgeTool;
 import org.cloud.sonic.agent.tests.TaskManager;
 import org.cloud.sonic.agent.tests.android.AndroidTestTaskBootThread;
+import org.cloud.sonic.agent.tools.SpringTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,6 +32,8 @@ import static org.cloud.sonic.agent.tests.android.AndroidTestTaskBootThread.ANDR
 
 public class ScrcpyServerUtil {
     private final Logger logger = LoggerFactory.getLogger(ScrcpyServerUtil.class);
+
+    private static final int DEFAULT_QUEUE_SIZE = 120;
 
     public Thread start(
             String udId,
@@ -48,36 +51,67 @@ public class ScrcpyServerUtil {
     ) {
         IDevice iDevice = AndroidDeviceBridgeTool.getIDeviceByUdId(udId);
         String key = androidTestTaskBootThread.formatThreadName(ANDROID_TEST_TASK_BOOT_PRE);
-        int s;
-        if (tor == -1) {
-            s = AndroidDeviceBridgeTool.getScreen(AndroidDeviceBridgeTool.getIDeviceByUdId(udId));
-        } else {
-            s = tor;
-        }
-        // 启动scrcpy服务
-        ScrcpyLocalThread scrcpyThread = new ScrcpyLocalThread(iDevice, s, session, androidTestTaskBootThread);
+        int screenRotation = tor == -1
+                ? AndroidDeviceBridgeTool.getScreen(AndroidDeviceBridgeTool.getIDeviceByUdId(udId))
+                : tor;
+
+        ScrcpyLocalThread scrcpyThread = new ScrcpyLocalThread(iDevice, screenRotation, session, androidTestTaskBootThread);
         TaskManager.startChildThread(key, scrcpyThread);
 
-        // 等待启动
         int wait = 0;
-        while (!scrcpyThread.getIsFinish().tryAcquire()) {
+        boolean ready = false;
+        while (!(ready = scrcpyThread.getIsFinish().tryAcquire())) {
             wait++;
             try {
                 Thread.sleep(500);
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                Thread.currentThread().interrupt();
+                break;
             }
-            // 启动失败了，强行跳过，保证其它服务可用
             if (wait > 8) {
                 break;
             }
         }
-        // 启动输入流
-        ScrcpyInputSocketThread scrcpyInputSocketThread = new ScrcpyInputSocketThread(iDevice, new LinkedBlockingQueue<>(), scrcpyThread, session);
-        // 启动输出流
+
+        if (!ready) {
+            logger.warn("scrcpy server did not become ready for {} within {} ms, skip socket startup.",
+                    udId, wait * 500);
+            if (scrcpyThread.isAlive()) {
+                scrcpyThread.interrupt();
+            }
+            return null;
+        }
+
+        ScrcpyInputSocketThread scrcpyInputSocketThread = new ScrcpyInputSocketThread(
+                iDevice,
+                new LinkedBlockingQueue<>(getQueueSize()),
+                scrcpyThread,
+                session
+        );
         ScrcpyOutputSocketThread scrcpyOutputSocketThread = new ScrcpyOutputSocketThread(scrcpyInputSocketThread, session);
         TaskManager.startChildThread(key, scrcpyInputSocketThread, scrcpyOutputSocketThread);
-        return scrcpyThread; // server线程
+        return scrcpyThread;
     }
 
+    private int getQueueSize() {
+        String raw = SpringTool.getPropertiesValue("modules.android.scrcpy.queue-size");
+        if (raw == null || raw.isBlank()) {
+            raw = SpringTool.getPropertiesValue("modules.android.scrcpy.queueSize");
+        }
+        if (raw == null || raw.isBlank()) {
+            return DEFAULT_QUEUE_SIZE;
+        }
+        try {
+            int v = Integer.parseInt(raw.trim());
+            if (v < 20) {
+                return 20;
+            }
+            if (v > 1000) {
+                return 1000;
+            }
+            return v;
+        } catch (Exception ignored) {
+            return DEFAULT_QUEUE_SIZE;
+        }
+    }
 }

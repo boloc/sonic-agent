@@ -256,11 +256,17 @@ public class TransportClient extends WebSocketClient {
                         TransportWorker.client.send(agentInfo.toJSONString());
                         IDevice[] iDevices = AndroidDeviceBridgeTool.getRealOnLineDevices();
                         for (IDevice d : iDevices) {
-                            String status = AndroidDeviceManagerMap.getStatusMap().get(d.getSerialNumber());
+                            // 使用稳定的 udId 发送给 Server（WiFi 设备只使用 IP）
+                            String serialNumber = d.getSerialNumber();
+                            String udId = WiFiDeviceIdMap.getStableUdId(serialNumber);
+                            // 注册 WiFi 设备的映射关系
+                            WiFiDeviceIdMap.register(serialNumber);
+                            // 状态 Map 还是用原始 serialNumber
+                            String status = AndroidDeviceManagerMap.getStatusMap().get(serialNumber);
                             if (status != null) {
-                                AndroidDeviceLocalStatus.send(d.getSerialNumber(), status);
+                                AndroidDeviceLocalStatus.send(udId, status);
                             } else {
-                                AndroidDeviceLocalStatus.send(d.getSerialNumber(), d.getState() == null ? null : d.getState().toString());
+                                AndroidDeviceLocalStatus.send(udId, d.getState() == null ? null : d.getState().toString());
                             }
                         }
                         List<String> udIds = SibTool.getDeviceList();

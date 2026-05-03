@@ -24,7 +24,9 @@ import org.cloud.sonic.agent.bridge.android.AndroidDeviceBridgeTool;
 import org.cloud.sonic.agent.common.enums.AndroidKey;
 import org.cloud.sonic.agent.common.maps.AndroidDeviceManagerMap;
 import org.cloud.sonic.agent.common.maps.HandlerMap;
+import org.cloud.sonic.agent.common.maps.WiFiDeviceIdMap;
 import org.cloud.sonic.agent.tools.PortTool;
+import org.cloud.sonic.agent.tools.SpringTool;
 import org.cloud.sonic.driver.common.tool.SonicRespException;
 
 import java.io.IOException;
@@ -44,6 +46,7 @@ public class AndroidTouchHandler {
     private static final Map<String, Thread> touchMap = new ConcurrentHashMap<>();
     private static final Map<String, TouchMode> touchModeMap = new ConcurrentHashMap<>();
     private static final Map<String, int[]> sizeMap = new ConcurrentHashMap<>();
+    private static final int DEFAULT_SCRCPY_MAX_SIZE = 0;
     // 默认的滑动操作完成时间，单位为毫秒
     private static final int DEFAULT_SWIPE_DURATION = 500;
 
@@ -67,15 +70,16 @@ public class AndroidTouchHandler {
                 int[] re = transferWithRotation(iDevice, x, y);
                 writeToOutputStream(iDevice, String.format("down %d %d\n", re[0], re[1]));
                 try {
-                    Thread.sleep(300);
+                    Thread.sleep(150);  // 确保设备识别为点击
                 } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    Thread.currentThread().interrupt();
                 }
                 writeToOutputStream(iDevice, "up\n");
             }
             case ADB -> AndroidDeviceBridgeTool.executeCommand(iDevice, String.format("input tap %d %d", x, y));
             case APPIUM_UIAUTOMATOR2_SERVER -> {
-                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                String udId = WiFiDeviceIdMap.getStableUdId(iDevice.getSerialNumber());
+                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(udId);
                 if (curStepHandler != null && curStepHandler.getAndroidDriver() != null) {
                     curStepHandler.getAndroidDriver().tap(x, y);
                 }
@@ -98,7 +102,8 @@ public class AndroidTouchHandler {
             }
             case ADB -> AndroidDeviceBridgeTool.executeCommand(iDevice, String.format("input swipe %d %d %d %d %d", x, y, x, y, time));
             case APPIUM_UIAUTOMATOR2_SERVER -> {
-                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                String udId = WiFiDeviceIdMap.getStableUdId(iDevice.getSerialNumber());
+                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(udId);
                 if (curStepHandler != null && curStepHandler.getAndroidDriver() != null) {
                     curStepHandler.getAndroidDriver().longPress(x, y, time);
                 }
@@ -118,9 +123,9 @@ public class AndroidTouchHandler {
                 int[] re2 = transferWithRotation(iDevice, x2, y2);
                 writeToOutputStream(iDevice, String.format("down %d %d\n", re1[0], re1[1]));
                 try {
-                    Thread.sleep(300);
+                    Thread.sleep(100);  // 确保滑动开始
                 } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    Thread.currentThread().interrupt();
                 }
                 long startTime = System.currentTimeMillis();
                 while (true) {
@@ -145,20 +150,21 @@ public class AndroidTouchHandler {
                     try {
                         Thread.sleep(5);
                     } catch (InterruptedException e) {
-                        e.printStackTrace();
+                        Thread.currentThread().interrupt();
                     }
                 }
                 try {
-                    Thread.sleep(200);
+                    Thread.sleep(100);  // 确保滑动完成
                 } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    Thread.currentThread().interrupt();
                 }
                 writeToOutputStream(iDevice, "up\n");
             }
             case ADB -> AndroidDeviceBridgeTool.executeCommand(iDevice, String.format("input swipe %d %d %d %d %d",
                     x1, y1, x2, y2, swipeDuration));
             case APPIUM_UIAUTOMATOR2_SERVER -> {
-                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                String udId = WiFiDeviceIdMap.getStableUdId(iDevice.getSerialNumber());
+                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(udId);
                 if (curStepHandler != null && curStepHandler.getAndroidDriver() != null) {
                     curStepHandler.getAndroidDriver().swipe(x1, y1, x2, y2, swipeDuration);
                 }
@@ -176,7 +182,8 @@ public class AndroidTouchHandler {
             case ADB ->
                     AndroidDeviceBridgeTool.executeCommand(iDevice, String.format("input draganddrop %d %d %d %d %d", x1, y1, x2, y2, swipeDuration));
             case APPIUM_UIAUTOMATOR2_SERVER -> {
-                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                String udId = WiFiDeviceIdMap.getStableUdId(iDevice.getSerialNumber());
+                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(udId);
                 if (curStepHandler != null && curStepHandler.getAndroidDriver() != null) {
                     curStepHandler.getAndroidDriver().drag(x1, y1, x2, y2, swipeDuration, null, null);
                 }
@@ -238,7 +245,8 @@ public class AndroidTouchHandler {
                 writeToOutputStream(iDevice, String.format("%s %d %d\n", motionEventType.toLowerCase(), re1[0], re1[1]));
             }
             case APPIUM_UIAUTOMATOR2_SERVER -> {
-                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                String udId = WiFiDeviceIdMap.getStableUdId(iDevice.getSerialNumber());
+                AndroidStepHandler curStepHandler = HandlerMap.getAndroidMap().get(udId);
                 if (curStepHandler != null && curStepHandler.getAndroidDriver() != null) {
                     curStepHandler.getAndroidDriver().touchAction(motionEventType.toLowerCase(), x1, y1);
                 }
@@ -286,6 +294,85 @@ public class AndroidTouchHandler {
         } else {
             log.info("{} write output stream is null.", iDevice.getSerialNumber());
         }
+    }
+
+    public static void writeScreenTouchToOutputStream(IDevice iDevice, String msg) {
+        writeToOutputStream(iDevice, convertScreenTouchToDeviceTouch(iDevice, msg));
+    }
+
+    private static String convertScreenTouchToDeviceTouch(IDevice iDevice, String msg) {
+        if (msg == null || msg.isBlank()) {
+            return msg;
+        }
+        String trimmed = msg.trim();
+        String[] parts = trimmed.split("\\s+");
+        if (parts.length != 3 || (!"down".equals(parts[0]) && !"move".equals(parts[0]))) {
+            return msg;
+        }
+
+        try {
+            int screenX = Integer.parseInt(parts[1]);
+            int screenY = Integer.parseInt(parts[2]);
+            int[] deviceSize = getDeviceSize(iDevice);
+            int[] videoSize = getScrcpyVideoSize(deviceSize[0], deviceSize[1]);
+            int deviceX = clamp((int) Math.round(screenX * (double) deviceSize[0] / videoSize[0]), 0, deviceSize[0] - 1);
+            int deviceY = clamp((int) Math.round(screenY * (double) deviceSize[1] / videoSize[1]), 0, deviceSize[1] - 1);
+            return String.format("%s %d %d\n", parts[0], deviceX, deviceY);
+        } catch (Exception e) {
+            log.warn("convert screen touch failed, passthrough raw touch: {}", msg.trim());
+            return msg;
+        }
+    }
+
+    private static int[] getDeviceSize(IDevice iDevice) {
+        int[] cached = sizeMap.get(iDevice.getSerialNumber());
+        if (cached != null) {
+            return cached;
+        }
+        String size = AndroidDeviceBridgeTool.getScreenSize(iDevice);
+        int[] parsed = Arrays.stream(size.split("x")).mapToInt(Integer::parseInt).toArray();
+        sizeMap.put(iDevice.getSerialNumber(), parsed);
+        return parsed;
+    }
+
+    private static int[] getScrcpyVideoSize(int deviceWidth, int deviceHeight) {
+        int maxSize = getScrcpyMaxSize();
+        if (maxSize <= 0) {
+            return new int[]{deviceWidth, deviceHeight};
+        }
+        int longerSide = Math.max(deviceWidth, deviceHeight);
+        if (longerSide <= maxSize) {
+            return new int[]{deviceWidth, deviceHeight};
+        }
+        double scale = (double) maxSize / longerSide;
+        return new int[]{
+                Math.max(2, toEvenSize(deviceWidth * scale)),
+                Math.max(2, toEvenSize(deviceHeight * scale))
+        };
+    }
+
+    private static int getScrcpyMaxSize() {
+        String raw = SpringTool.getPropertiesValue("modules.android.scrcpy.max-size");
+        if (raw == null || raw.isBlank()) {
+            raw = SpringTool.getPropertiesValue("modules.android.scrcpy.maxSize");
+        }
+        if (raw == null || raw.isBlank()) {
+            return DEFAULT_SCRCPY_MAX_SIZE;
+        }
+        try {
+            return Math.max(0, Integer.parseInt(raw.trim()));
+        } catch (Exception ignored) {
+            return DEFAULT_SCRCPY_MAX_SIZE;
+        }
+    }
+
+    private static int toEvenSize(double value) {
+        int size = (int) Math.round(value);
+        return size % 2 == 0 ? size : size - 1;
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     public static void startTouch(IDevice iDevice) {

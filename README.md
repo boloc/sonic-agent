@@ -1,82 +1,200 @@
-<p align="center">
-  <img width="80px" src="https://raw.githubusercontent.com/SonicCloudOrg/sonic-server/main/logo.png">
-</p>
-<p align="center">🎉Agent of Sonic Cloud Real Machine Platform</p>
-<p align="center">
-  <span>English |</span>
-  <a href="https://github.com/SonicCloudOrg/sonic-agent/blob/main/README_CN.md">  
-     简体中文
-  </a>
-</p>
-<p align="center">
-  <a href="#">  
-    <img src="https://img.shields.io/github/v/release/SonicCloudOrg/sonic-agent?include_prereleases">
-  </a>
-  <a href="#">  
-    <img src="https://img.shields.io/badge/platform-windows|macosx|linux-success">
-  </a>
-</p>
-<p align="center">
-  <a href="#">  
-    <img src="https://img.shields.io/github/commit-activity/m/SonicCloudOrg/sonic-agent">
-  </a>
-  <a href="#">  
-    <img src="https://img.shields.io/github/downloads/SonicCloudOrg/sonic-agent/total">
-  </a>
-  <a href="https://github.com/SonicCloudOrg/sonic-server/blob/main/LICENSE">  
-    <img src="https://img.shields.io/github/license/SonicCloudOrg/sonic-server?color=green&label=license&logo=license&logoColor=green">
-  </a>
-</p>
+# Sonic Agent
 
-### Official Website
+Sonic 云真机测试平台的 Agent 端，负责连接和控制真实设备（Android/iOS）。
+[文档地址](https://soniccloudorg.github.io/deploy/agent-deploy.html)
 
-[Sonic Official Website](https://soniccloudorg.github.io/)
+## 📋 环境要求
 
-## Background
+| 依赖 | 版本要求 | 说明 |
+|------|---------|------|
+| JDK | 17+ | 必须使用 Java 17 或更高版本 |
+| Maven | 3.6+ | 用于构建项目 |
+| ADB | 最新版 | Android 设备调试（Android 必需） |
+| Xcode | 最新版 | iOS 设备调试（仅 macOS，iOS 必需） |
 
-#### What is sonic ?
+## 🔧 配置文件
 
-> Sonic is a platform that integrates remote control debugging and automated testing of mobile devices, and strives to
-> create a better use experience for global developers and test engineers.
->
->If you want to participate, welcome to join us! 💪
->
->If you want to support, you can give me a star. ⭐
+配置文件位于 `config/application-sonic-agent.yml`：
 
-## Deploy
+```yaml
+sonic:
+  agent:
+    # Agent 机器的 IP 地址（必须是其他机器可访问的 IP）
+    host: 192.168.1.100
+    # Agent 服务端口
+    port: 7777
+    # 在 Sonic 前端"新增 Agent"时生成的 Key
+    key: your-agent-key-here
+  server:
+    # Sonic Server 的地址
+    host: your-server-ip
+    # Sonic Server 的端口（前端访问端口）
+    port: 3000
 
-[Look Here!](https://soniccloudorg.github.io/deploy/agent-deploy.html)
+modules:
+  android:
+    scrcpy:
+      # (可选) 远程查看时降低带宽/延迟：限制分辨率/帧率
+      # max-size: 1280   # 0 表示不限制
+      # max-fps: 30      # 建议 15/20/30
+      # video-codec: h264 # 或 h265（依赖设备支持）
+  ios:
+    # WebDriverAgent 的 Bundle ID
+    wda-bundle-id: com.sonic.WebDriverAgentRunner
+    # (仅 macOS) WDA 的 Xcode 项目路径
+    wda-xcode-project-path: WebdriverAgent/WebDriverAgent.xcodeproj
+```
 
-## Package
+## 🏗️ 构建方式
 
-[Look Here!](https://soniccloudorg.github.io/contribute/con-agent.html)
+### 支持的平台
 
-## Sponsors
+在 `pom.xml` 中修改 `<platform>` 属性：
 
-Thank you to all our sponsors!
+| 平台值 | 说明 |
+|-------|------|
+| `windows-x86` | Windows 32位 |
+| `windows-x86_64` | Windows 64位 |
+| `macosx-arm64` | macOS ARM (M1/M2/M3) |
+| `macosx-x86_64` | macOS Intel |
+| `linux-arm64` | Linux ARM64 |
+| `linux-x86` | Linux 32位 |
+| `linux-x86_64` | Linux 64位 |
 
-[<img src="https://ceshiren.com/uploads/default/original/3X/7/0/70299922296e93e2dcab223153a928c4bfb27df9.jpeg" alt="霍格沃兹测试开发学社" width="500">](https://qrcode.testing-studio.com/f?from=sonic&url=https://ceshiren.com)
+### 构建命令
 
-> [霍格沃兹测试开发学社](https://qrcode.testing-studio.com/f?from=sonic&url=https://ceshiren.com)
-> 是业界领先的测试开发技术高端教育品牌，隶属于[测吧（北京）科技有限公司](http://qrcode.testing-studio.com/f?from=sonic&url=https://www.testing-studio.com)
-> 。学院课程由一线大厂测试经理与资深测试开发专家参与研发，实战驱动。课程涵盖 web/app
->
-自动化测试、接口测试、性能测试、安全测试、持续集成/持续交付/DevOps，测试左移&右移、精准测试、测试平台开发、测试管理等内容，帮助测试工程师实现测试开发技术转型。通过优秀的学社制度（奖学金、内推返学费、行业竞赛等多种方式）来实现学员、学社及用人企业的三方共赢。[进入测试开发技术能力测评!](https://qrcode.testing-studio.com/f?from=sonic&url=https://ceshiren.com/t/topic/14940)
+```bash
+# 1. 进入项目目录
+cd sonic-agent
 
-## LICENSE
+# 2. 修改 pom.xml 中的 platform 为目标平台（可选）
+# 默认为 linux-arm64
 
-[License](LICENSE)
+# 3. 构建项目
+mvn clean package -DskipTests
 
-- Binary files in the mini folder are from [minicap](https://github.com/openstf/minicap)
-  license: [Apache 2.0 License](licenses/LICENSE.minicap)
-- sonic-android-scrcpy.jar in the plugins folder is from sonic-android-scrcpy fork
-  from [scrcpy](https://github.com/Genymobile/scrcpy) license: [Apache 2.0 License](licenses/LICENSE.scrcpy)
-- sonic-appium-uiautomator2-server*.apk in the plugins folder are from sonic-appium-uiautomator2-server fork
-  from [appium-uiautomator2-server](https://github.com/appium/appium-uiautomator2-server)
-  license: [Apache 2.0 License](licenses/LICENSE.appium-uiautomator2-server)
-- sonic-go-mitmproxy in the plugins folder is from sonic-go-mitmproxy fork
-  from [go-mitmproxy](https://github.com/lqqyt2423/go-mitmproxy) license: [MIT License](licenses/LICENSE.go-mitmproxy)
-- WebDriverAgent is from sonic-ios-wda fork from [WebDriverAgent](https://github.com/appium/WebDriverAgent)
-  license: [BSD License](licenses/LICENSE.WebDriverAgent)
-- Poco-SDK is from sonic-sdk-poco fork from [Poco-SDK](https://github.com/AirtestProject/Poco-SDK)
-  license: [Apache 2.0 License](licenses/LICENSE.Poco-SDK)
+# 4. 构建产物位于
+# target/sonic-agent-{platform}.jar
+```
+
+### 指定平台构建（无需修改 pom.xml）
+
+```bash
+# linux-arm64
+java -Dfile.encoding=utf-8 -jar sonic-agent-linux-arm64.jar
+
+# Windows 64位
+mvn clean package -DskipTests -Dplatform=windows-x86_64
+
+# macOS ARM (M1/M2/M3)
+mvn clean package -DskipTests -Dplatform=macosx-arm64
+
+# Linux 64位
+mvn clean package -DskipTests -Dplatform=linux-x86_64
+```
+
+## 🚀 启动方式
+
+### 启动命令
+
+```bash
+# 进入 JAR 所在目录，确保 config/application-sonic-agent.yml 配置正确
+java -Dfile.encoding=utf-8 -jar sonic-agent-{platform}.jar
+```
+
+> ⚠️ **注意**：`-Dfile.encoding=utf-8` 必须放在 `-jar` 之前，否则不会生效！
+
+### 后台运行（Linux/macOS）
+
+```bash
+# 后台启动
+# nohup java -Dfile.encoding=utf-8 -jar sonic-agent-{platform}.jar > logs/sonic-agent.log 2>&1 &
+nohup java -Dfile.encoding=utf-8 -jar sonic-agent-linux-arm64.jar > logs/sonic-agent.log 2>&1 &
+# 查看日志
+tail -f logs/sonic-agent.log
+
+# 查看进程
+ps aux | grep sonic-agent
+
+# 停止服务
+kill $(pgrep -f sonic-agent)
+```
+
+### Windows 后台运行
+
+```batch
+:: 创建启动脚本 start.bat
+start /b java -Dfile.encoding=utf-8 -jar sonic-agent-windows-x86_64.jar > logs\sonic-agent.log 2>&1
+```
+
+## 📁 目录结构
+
+```text
+sonic-agent/
+├── config/
+│   └── application-sonic-agent.yml  # 配置文件
+├── mini/                            # minicap 相关文件（Android 截图）
+├── plugins/                         # 插件目录
+│   ├── adb                          # ADB 可执行文件
+│   ├── sonic-android-apk.apk        # Sonic Android APK
+│   ├── sonic-android-scrcpy.jar     # Scrcpy 服务
+│   └── ...
+├── logs/                            # 日志目录（运行时生成）
+├── src/                             # 源代码
+├── pom.xml                          # Maven 配置
+└── README.md
+```
+
+## 🔍 验证启动
+
+1. **查看日志**：确认没有报错
+2. **访问 Agent**：浏览器打开 `http://Agent_IP:7777`
+3. **检查 Sonic 前端**：在设备中心查看 Agent 是否在线
+
+## ⚠️ 常见问题
+
+### Q: Agent 无法连接 Server？
+
+- 检查 `sonic.server.host` 是否正确
+- 确保 Server 端口可访问
+- 检查 `sonic.agent.key` 是否正确
+
+### Q: 设备无法识别？
+
+- Android：确保 ADB 已安装且设备已开启 USB 调试
+- iOS：确保 Xcode 已安装且设备已信任电脑
+
+### Q: Android 11+ 无线调试（WiFi ADB）连接后，一打开 Agent 就立刻 offline/掉线？
+
+- **常见原因**：主机上同时存在多个不同版本的 ADB（例如 Android Studio 的 platform-tools 与 Agent 自带 `plugins/adb`），它们会反复触发
+  `adb server is out of date... killing...`，导致 **无线调试的临时端口连接被重置**，设备立刻变 `offline`，旧端口也随即失效（这是无线调试的正常表现）。
+- **解决思路**：确保 *所有* `adb` 操作（包括你手动执行的 `adb connect` 和 Agent 内部使用的 adb）使用 **同一个 adb 版本/路径**：
+  - **推荐**：设置 `ANDROID_HOME` 指向你安装的最新 `platform-tools`，并保证 `PATH` 里使用的也是同一套 `adb`
+  - 或者：用 Agent 自带的 `plugins/adb` 来执行 `adb connect`
+  - 或者：把最新的 `adb` 替换到 `plugins/adb`，避免版本不一致
+
+### Q: 提示 Java 版本不兼容？
+
+- 确保使用 Java 17 或更高版本
+- 运行 `java -version` 检查版本
+
+
+```bash
+settings put global hidden_api_policy 1
+settings put global hidden_api_policy_pre_p_apps 1
+settings put global hidden_api_policy_p_apps 1
+
+cmd deviceidle whitelist +io.appium.uiautomator2.server
+cmd deviceidle whitelist +io.appium.uiautomator2.server.test
+cmd deviceidle whitelist +org.cloud.sonic.android
+
+cmd appops set io.appium.uiautomator2.server RUN_ANY_IN_BACKGROUND allow
+cmd appops set io.appium.uiautomator2.server.test RUN_ANY_IN_BACKGROUND allow
+cmd appops set org.cloud.sonic.android RUN_IN_BACKGROUND allow
+cmd appops set org.cloud.sonic.android RUN_ANY_IN_BACKGROUND allow
+
+am force-stop io.appium.uiautomator2.server
+am force-stop io.appium.uiautomator2.server.test
+
+
+```

@@ -66,8 +66,8 @@ public class MiniCapInputSocketThread extends Thread {
         this.session = session;
         this.androidTestTaskBootThread = miniCapPro.getAndroidTestTaskBootThread();
 
-        // 让资源合理关闭
-        this.setDaemon(false);
+        // 改为守护线程，防止阻止 JVM 退出
+        this.setDaemon(true);
         this.setName(androidTestTaskBootThread.formatThreadName(ANDROID_INPUT_SOCKET_PRE));
     }
 

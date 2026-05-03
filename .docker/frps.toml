@@ -1,0 +1,22 @@
+# frps 服务端监听端口。
+# 内网 frpc 的 serverPort 要填写这个端口，例如：serverPort = 8055。
+bindPort = 8055
+
+# frpc 和 frps 的认证方式。
+# 内网 frpc.toml 中的 auth.method/auth.token 必须和这里完全一致。
+auth.method = "token"
+auth.token = "e17298aed3f01ad9d9c130be3e4789cf"
+
+# frps 管理后台配置。
+# 访问地址：http://公网服务器IP:7500
+# 生产环境建议在云安全组/防火墙中只允许你的固定 IP 访问 7500。
+webServer.addr = "0.0.0.0"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "Zhouzepeng1,"
+
+# 日志输出到 Docker 控制台。
+# 查看命令：docker logs -f frps
+log.to = "console"
+log.level = "info"
+log.maxDays = 2

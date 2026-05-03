@@ -99,11 +99,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         restTemplate = restTemplateBean;
         IOSDeviceThreadPool.cachedThreadPool.execute(() -> {
             String processName = "sib";
-            if (GlobalProcessMap.getMap().get(processName) != null) {
-                Process ps = GlobalProcessMap.getMap().get(processName);
-                ps.children().forEach(ProcessHandle::destroy);
-                ps.destroy();
-            }
+            // 使用辅助方法终止旧进程并从 Map 中移除，防止内存泄漏
+            GlobalProcessMap.terminateAndRemove(processName);
             Process listenProcess = null;
             String commandLine = "%s devices listen -d";
             String system = System.getProperty("os.name").toLowerCase();
@@ -118,6 +115,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             } catch (Exception e) {
                 e.printStackTrace();
             }
+            // 立即将进程放入 Map，这样可以在需要时终止它
+            GlobalProcessMap.getMap().put(processName, listenProcess);
             InputStreamReader inputStreamReader = new InputStreamReader(listenProcess.getInputStream());
             BufferedReader stdInput = new BufferedReader(inputStreamReader);
             String s;
@@ -129,11 +128,15 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                     logger.info(e.getMessage());
                     break;
                 }
-                JSONObject r = JSONObject.parseObject(s);
-                if (r.getString("status").equals("online")) {
-                    sendOnlineStatus(r);
-                } else if (r.getString("status").equals("offline")) {
-                    sendDisConnectStatus(r);
+                try {
+                    JSONObject r = JSONObject.parseObject(s);
+                    if (r.getString("status").equals("online")) {
+                        sendOnlineStatus(r);
+                    } else if (r.getString("status").equals("offline")) {
+                        sendDisConnectStatus(r);
+                    }
+                } catch (JSONException e) {
+                    logger.debug("Failed to parse sib output: {}", s);
                 }
                 logger.info(s);
             }
@@ -148,7 +151,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                 e.printStackTrace();
             }
             logger.info("listen done.");
-            GlobalProcessMap.getMap().put(processName, listenProcess);
+            // 循环结束后从 Map 中移除
+            GlobalProcessMap.getMap().remove(processName);
         });
 
         ScheduleTool.scheduleAtFixedRate(
@@ -289,7 +293,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
+                        Thread.currentThread().interrupt();
+                        logger.info(e.getMessage());
+                        return;
                     }
                     isFinish.release();
                 }
@@ -313,6 +319,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             wait++;
             if (wait >= 120) {
                 logger.info(udId + " WebDriverAgent start timeout!");
+                wdaProcess.destroy();
                 return new int[]{0, 0};
             }
         }
@@ -347,11 +354,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopSysLog(String udId) {
         String processName = String.format("process-%s-syslog", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static void getSysLog(String udId, String filter, Session session) {
@@ -407,11 +411,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopOrientationWatcher(String udId) {
         String processName = String.format("process-%s-orientation", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static void orientationWatcher(String udId, Session session) {
@@ -430,6 +431,10 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             }
             String processName = String.format("process-%s-orientation", udId);
             GlobalProcessMap.getMap().put(processName, ps);
+
+            if (ps == null) {
+                return;
+            }
             InputStreamReader inputStreamReader = new InputStreamReader(ps.getInputStream());
             BufferedReader stdInput = new BufferedReader(inputStreamReader);
             String s;
@@ -489,12 +494,15 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        if (appListProcess == null) {
+            return result;
+        }
         InputStreamReader inputStreamReader = new InputStreamReader(appListProcess.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
         String s;
         while (true) {
             try {
-                if (StringUtils.isEmpty(s = stdInput.readLine()))
+                if (!StringUtils.hasText(s = stdInput.readLine()))
                     break;
             } catch (IOException e) {
                 logger.info(e.getMessage());
@@ -542,6 +550,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             }
         } catch (Exception e) {
             e.printStackTrace();
+        }
+        if (appProcess == null) {
+            return;
         }
         InputStreamReader inputStreamReader = new InputStreamReader(appProcess.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
@@ -619,11 +630,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopWebInspector(String udId) {
         String processName = String.format("process-%s-web-inspector", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static int startWebInspector(String udId) {
@@ -642,6 +650,10 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        if (ps == null) {
+            return 0;
+        }
+
         InputStreamReader inputStreamReader = new InputStreamReader(ps.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
         InputStreamReader err = new InputStreamReader(ps.getErrorStream());
@@ -708,7 +720,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             try {
                 Thread.sleep(500);
             } catch (InterruptedException ex) {
-                throw new RuntimeException(ex);
+                Thread.currentThread().interrupt();
+                logger.info(ex.getMessage());
+                return 0;
             }
             wait++;
             if (wait >= 120) {
@@ -723,11 +737,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopProxy(String udId, int target) {
         String processName = String.format("process-%s-proxy-%d", udId, target);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static void proxy(String udId, int local, int target) {
@@ -746,6 +757,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         } catch (Exception e) {
             e.printStackTrace();
         }
+
         InputStreamReader inputStreamReader = new InputStreamReader(ps.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
         InputStreamReader err = new InputStreamReader(ps.getErrorStream());
@@ -854,7 +866,7 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
         HttpHeaders headers = new HttpHeaders();
         headers.add("Content-Type", "application/json");
         ResponseEntity<JSONArray> responseEntity = restTemplate.exchange("http://localhost:" + port + "/json/list",
-                HttpMethod.GET, new HttpEntity(headers), JSONArray.class);
+                HttpMethod.GET, new HttpEntity<>(headers), JSONArray.class);
         if (responseEntity.getStatusCode() == HttpStatus.OK) {
             return responseEntity.getBody().toJavaList(JSONObject.class);
         } else {
@@ -864,11 +876,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopPerfmon(String udId) {
         String processName = String.format("process-%s-perfmon", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static void startPerfmon(String udId, String bundleId, Session session, LogUtil logUtil, int interval) {
@@ -887,6 +896,9 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
             }
         } catch (Exception e) {
             e.printStackTrace();
+        }
+        if (ps == null) {
+            return;
         }
         InputStreamReader inputStreamReader = new InputStreamReader(ps.getInputStream());
         BufferedReader stdInput = new BufferedReader(inputStreamReader);
@@ -960,11 +972,8 @@ public class SibTool implements ApplicationListener<ContextRefreshedEvent> {
 
     public static void stopShare(String udId) {
         String processName = String.format("process-%s-sib-share", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 
     public static void startShare(String udId, Session session) {

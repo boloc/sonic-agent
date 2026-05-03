@@ -58,6 +58,8 @@ import org.cloud.sonic.vision.cv.SIFTFinder;
 import org.cloud.sonic.vision.cv.SimilarityChecker;
 import org.cloud.sonic.vision.cv.TemMatcher;
 import org.cloud.sonic.vision.models.FindResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Attribute;
 import org.jsoup.nodes.Document;
@@ -82,12 +84,35 @@ import static org.testng.Assert.*;
  * @date 2021/8/16 20:10
  */
 public class AndroidStepHandler {
+    private static final Logger LOGGER = LoggerFactory.getLogger(AndroidStepHandler.class);
     public LogUtil log = new LogUtil();
     private AndroidDriver androidDriver;
     private ChromeDriver chromeDriver;
     private PocoDriver pocoDriver = null;
     private JSONObject globalParams = new JSONObject();
     private IDevice iDevice;
+    private int uiaPort = 0;
+    private volatile long lastUiaRecoverTimeMs = 0L;
+
+    // UIAutomator2 心跳保活线程
+    private volatile Thread uiaHeartbeatThread = null;
+    private volatile boolean uiaHeartbeatRunning = false;
+    // 心跳间隔（毫秒）- 8 秒发送一次轻量级请求保持连接
+    private static final long UIA_HEARTBEAT_INTERVAL_MS = 8_000;
+    // 连续心跳失败次数阈值，超过则触发自愈
+    private static final int UIA_HEARTBEAT_FAIL_THRESHOLD = 3;
+    // 自愈冷却时间（毫秒）- 避免频繁自愈
+    private static final long UIA_RECOVER_COOLDOWN_MS = 15_000;
+    /**
+     * uiautomator2 的 XPath2 在部分 Android 版本/ROM 上会触发
+     * "Cannot set AccessibilityNodeInfo's field 'mSealed'..." 之类的反射限制异常。
+     * 开启 enforceXPath1 可回退到 XPath1 解析以绕过该问题。
+     */
+    private volatile boolean enforceXPath1Enabled = false;
+    // 当前设备的 API Level，用于针对高版本 Android 的稳定性优化
+    private volatile int currentApiLevel = 0;
+    // 是否为 WiFi ADB 连接
+    private volatile boolean isWifiAdbConnection = false;
     private int status = ResultDetailStatus.PASS;
     private int[] screenWindowPosition = {0, 0, 0, 0};
     private int pocoPort = 0;
@@ -131,9 +156,44 @@ public class AndroidStepHandler {
      */
     public void startAndroidDriver(IDevice iDevice, int uiaPort) throws Exception {
         this.iDevice = iDevice;
+        this.uiaPort = uiaPort;
         int retry = 0;
         Exception out = null;
-        while (retry <= 4) {
+
+        // 只基于 API Level 和连接类型判断，不针对特定厂商
+        boolean isWifiAdb = iDevice.getSerialNumber() != null && iDevice.getSerialNumber().contains(":");
+        this.isWifiAdbConnection = isWifiAdb;
+
+        int apiLevel = 0;
+        try {
+            String apiStr = iDevice.getProperty(IDevice.PROP_BUILD_API_LEVEL);
+            if (apiStr != null) {
+                apiLevel = Integer.parseInt(apiStr.trim());
+            }
+        } catch (Exception ignored) {}
+        this.currentApiLevel = apiLevel;
+
+        // 基于 API Level 分级：越高版本限制越多，需要更多重试
+        int maxRetry;
+        long retryDelay;
+        if (isWifiAdb && apiLevel >= 36) {
+            maxRetry = 10;     // WiFi + Android 16+: 最多重试
+            retryDelay = 5000;
+        } else if (isWifiAdb && apiLevel >= 35) {
+            maxRetry = 8;      // WiFi + Android 15
+            retryDelay = 4000;
+        } else if (isWifiAdb || apiLevel >= 35) {
+            maxRetry = 6;      // WiFi 或 Android 15+
+            retryDelay = 3500;
+        } else if (apiLevel >= 31) {
+            maxRetry = 5;      // Android 12+
+            retryDelay = 3000;
+        } else {
+            maxRetry = 4;      // 默认
+            retryDelay = 2000;
+        }
+
+        while (retry <= maxRetry) {
             try {
                 androidDriver = new AndroidDriver("http://127.0.0.1:" + uiaPort);
                 break;
@@ -142,15 +202,46 @@ public class AndroidStepHandler {
                 out = e;
             }
             retry++;
-            Thread.sleep(2000);
+            Thread.sleep(retryDelay);
         }
         if (androidDriver == null) {
             log.sendStepLog(StepType.ERROR, "连接 UIAutomator2 Server 失败！", "");
             setResultDetailStatus(ResultDetailStatus.FAIL);
             throw out;
         }
-        androidDriver.getUiaClient().setGlobalTimeOut(60000);
+
+        // 超时策略：基于 API Level 和连接类型，不针对厂商
+        int globalTimeout;
+        if (isWifiAdb && apiLevel >= 35) {
+            globalTimeout = 45000; // WiFi + Android 15+: 45 秒
+        } else if (isWifiAdb && apiLevel >= 31) {
+            globalTimeout = 40000; // WiFi + Android 12-14: 40 秒
+        } else if (isWifiAdb || apiLevel >= 35) {
+            globalTimeout = 35000; // WiFi 或 Android 15+: 35 秒
+        } else if (apiLevel >= 31) {
+            globalTimeout = 35000; // Android 12+: 35 秒
+        } else {
+            globalTimeout = 30000; // 默认 30 秒
+        }
+        androidDriver.getUiaClient().setGlobalTimeOut(globalTimeout);
+        log.sendStepLog(StepType.INFO, "UIAutomator2 超时设置", "API Level: " + apiLevel + ", 超时: " + globalTimeout + "ms");
         log.sendStepLog(StepType.PASS, "连接 UIAutomator2 Server 成功", "");
+
+        // 只有 Android 16+ (API 36+) 才主动启用 enforceXPath1
+        // Android 15 及以下版本保持原有逻辑：遇到问题时由 tryEnableEnforceXPath1() 自动切换
+        if (apiLevel >= 36) {
+            try {
+                JSONObject settings = new JSONObject();
+                settings.put("enforceXPath1", true);
+                androidDriver.setAppiumSettings(settings);
+                enforceXPath1Enabled = true;
+                log.sendStepLog(StepType.INFO, "Android 16+ 兼容性设置", "已启用 enforceXPath1");
+            } catch (Exception e) {
+                // 失败也没关系，运行时会自动重试
+                LOGGER.debug("Pre-enable enforceXPath1 failed for device={}, will retry at runtime",
+                           iDevice.getSerialNumber());
+            }
+        }
 
         // 获取屏幕的宽度与高度
         String screenSizeInfo = AndroidDeviceBridgeTool.getScreenSize(iDevice);
@@ -161,6 +252,317 @@ public class AndroidStepHandler {
                 iDevice.getSerialNumber(), iDevice.getProperty(IDevice.PROP_DEVICE_MANUFACTURER),
                 iDevice.getProperty(IDevice.PROP_DEVICE_MODEL),
                 screenSizeInfo);
+
+        // 启动心跳保活线程，防止 UIAutomator2 Server 被系统杀死
+        startUiaHeartbeat();
+    }
+
+    /**
+     * 启动 UIAutomator2 心跳保活线程。
+     * 定期发送轻量级请求（getSessionId）保持连接活跃，防止 Android 系统杀死空闲进程。
+     * 注意：心跳线程只负责检测问题和记录日志，不主动触发自愈（避免死锁）。
+     * 自愈由用户操作时的异常处理来触发。
+     */
+    private void startUiaHeartbeat() {
+        stopUiaHeartbeat(); // 确保旧线程已停止
+        uiaHeartbeatRunning = true;
+        final Thread currentHeartbeatThread = new Thread(() -> {
+            int consecutiveFailures = 0;
+            LOGGER.info("UIAutomator2 heartbeat thread started for device: {}, interval={}ms",
+                    iDevice != null ? iDevice.getSerialNumber() : "unknown", UIA_HEARTBEAT_INTERVAL_MS);
+            while (uiaHeartbeatRunning && !Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(UIA_HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                // 使用本地变量避免并发修改问题
+                final AndroidDriver driver = androidDriver;
+                if (!uiaHeartbeatRunning || driver == null) {
+                    break;
+                }
+                try {
+                    // 发送轻量级请求：获取 session ID（几乎不消耗资源）
+                    String sessionId = driver.getSessionId();
+                    if (sessionId != null && !sessionId.isEmpty()) {
+                        consecutiveFailures = 0; // 重置失败计数
+                        LOGGER.debug("UIAutomator2 heartbeat OK: device={}, sessionId={}",
+                                iDevice.getSerialNumber(), sessionId);
+                    } else {
+                        consecutiveFailures++;
+                        LOGGER.warn("UIAutomator2 heartbeat returned null session: device={}, failures={}",
+                                iDevice.getSerialNumber(), consecutiveFailures);
+                    }
+                } catch (Exception e) {
+                    consecutiveFailures++;
+                    LOGGER.warn("UIAutomator2 heartbeat failed: device={}, failures={}, error={}",
+                            iDevice.getSerialNumber(), consecutiveFailures, e.getMessage());
+
+                    // 第一次失败时尝试唤醒屏幕，Android 16 可能因屏幕关闭而限制后台 instrument
+                    if (consecutiveFailures == 1 && iDevice != null) {
+                        try {
+                            AndroidDeviceBridgeTool.wakeUpScreen(iDevice);
+                        } catch (Exception ignored) {}
+                    }
+
+                    // 连续失败达到阈值，记录警告但不主动触发自愈（避免死锁）
+                    // 自愈会在下次用户操作失败时由 recoverUiaIfNeeded 触发
+                    if (consecutiveFailures >= UIA_HEARTBEAT_FAIL_THRESHOLD) {
+                        LOGGER.warn("UIAutomator2 heartbeat failed {} times for device: {}, recovery will be triggered on next operation",
+                                consecutiveFailures, iDevice.getSerialNumber());
+                        // 标记需要恢复，但不在心跳线程中执行（避免死锁）
+                        // 退出心跳循环，等待下次操作触发自愈后重建心跳
+                        break;
+                    }
+                }
+            }
+            LOGGER.info("UIAutomator2 heartbeat thread stopped for device: {}",
+                    iDevice != null ? iDevice.getSerialNumber() : "unknown");
+        }, "uia-heartbeat-" + (iDevice != null ? iDevice.getSerialNumber() : "unknown"));
+        uiaHeartbeatThread = currentHeartbeatThread;
+        uiaHeartbeatThread.setDaemon(true);
+        uiaHeartbeatThread.start();
+    }
+
+    /**
+     * 停止 UIAutomator2 心跳保活线程
+     */
+    private void stopUiaHeartbeat() {
+        uiaHeartbeatRunning = false;
+        if (uiaHeartbeatThread != null) {
+            uiaHeartbeatThread.interrupt();
+            try {
+                uiaHeartbeatThread.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            uiaHeartbeatThread = null;
+        }
+    }
+
+    private static boolean isUiaConnectionError(Throwable e) {
+        Throwable cur = e;
+        int depth = 0;
+        while (cur != null && depth++ < 10) {
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String m = msg.toLowerCase(Locale.ROOT);
+                if (m.contains("read timed out")
+                        || m.contains("sockettimeoutexception")
+                        || m.contains("unexpected end of file")
+                        || m.contains("connection refused")
+                        || m.contains("socketexception")
+                        || m.contains("broken pipe")
+                        // Session 丢失/过期错误也需要自愈
+                        || m.contains("session") && m.contains("not known")
+                        || m.contains("session") && m.contains("does not exist")
+                        || m.contains("invalid session")
+                        || m.contains("nosuchsession")) {
+                    return true;
+                }
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isEnforceXPath1WorkaroundError(Throwable e) {
+        Throwable cur = e;
+        int depth = 0;
+        while (cur != null && depth++ < 10) {
+            String msg = cur.getMessage();
+            if (msg != null) {
+                // Keep checks simple and robust across different driver/server versions.
+                // Example:
+                // Cannot set AccessibilityNodeInfo's field 'mSealed' to 'true'. Try changing the 'enforceXPath1' driver setting to 'true'...
+                String m = msg.toLowerCase(Locale.ROOT);
+                // Prefer matching the explicit hint if present; otherwise match the known hidden-api symptom.
+                if (m.contains("enforcexpath1")
+                        || (m.contains("accessibilitynodeinfo") && m.contains("msealed"))) {
+                    return true;
+                }
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    private boolean tryEnableEnforceXPath1(String selector, Throwable cause) {
+        if (enforceXPath1Enabled) return false;
+        if (androidDriver == null) return false;
+        if (!"xpath".equals(selector)) return false;
+        if (!isEnforceXPath1WorkaroundError(cause)) return false;
+        try {
+            JSONObject settings = new JSONObject();
+            settings.put("enforceXPath1", true);
+            androidDriver.setAppiumSettings(settings);
+            enforceXPath1Enabled = true;
+            log.sendStepLog(StepType.WARN, "检测到 XPath2 兼容性异常，已自动切换为 XPath1", "settings.enforceXPath1=true");
+            return true;
+        } catch (Throwable ex) {
+            // 不要因为兜底逻辑影响原始异常链路
+            LOGGER.warn("Enable enforceXPath1 failed: device={}, err={}",
+                    iDevice == null ? "" : iDevice.getSerialNumber(),
+                    compactErrorMessage(ex));
+            return false;
+        }
+    }
+
+    /**
+     * 将 XPath 2.0 的 matches() 函数转换为 XPath 1.0 兼容的 contains() 组合
+     * 例如: matches(@text, '9.*1.*台.*湾.*版') -> contains(@text, '9') and contains(@text, '1') and contains(@text, '台') and contains(@text, '湾') and contains(@text, '版')
+     */
+    private String convertMatchesToContains(String xpath) {
+        if (xpath == null || !xpath.contains("matches(")) {
+            return xpath;
+        }
+
+        try {
+            // 匹配 matches(@attr, 'pattern') 或 matches(@attr, "pattern")
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+                "matches\\s*\\(\\s*(@[\\w-]+)\\s*,\\s*['\"]([^'\"]+)['\"]\\s*\\)");
+            java.util.regex.Matcher matcher = pattern.matcher(xpath);
+
+            StringBuffer result = new StringBuffer();
+            while (matcher.find()) {
+                String attr = matcher.group(1);  // @text, @content-desc 等
+                String regex = matcher.group(2); // 正则表达式
+
+                // 将正则表达式按 .* 或 .+ 分割，提取关键词
+                String[] parts = regex.split("\\.\\*|\\+\\*|\\.\\+|\\+\\+");
+                List<String> keywords = new ArrayList<>();
+                for (String part : parts) {
+                    // 清理正则特殊字符，只保留实际文本
+                    String cleaned = part.replaceAll("[\\^\\$\\[\\]\\(\\)\\{\\}\\|\\\\]", "").trim();
+                    if (!cleaned.isEmpty()) {
+                        keywords.add(cleaned);
+                    }
+                }
+
+                if (keywords.isEmpty()) {
+                    // 无法提取关键词，保持原 matches() 不变
+                    matcher.appendReplacement(result, java.util.regex.Matcher.quoteReplacement(matcher.group(0)));
+                    continue;
+                }
+
+                // 构建 contains() 组合
+                StringBuilder containsExpr = new StringBuilder();
+                for (int i = 0; i < keywords.size(); i++) {
+                    if (i > 0) {
+                        containsExpr.append(" and ");
+                    }
+                    containsExpr.append("contains(").append(attr).append(", '").append(keywords.get(i)).append("')");
+                }
+
+                matcher.appendReplacement(result, java.util.regex.Matcher.quoteReplacement(containsExpr.toString()));
+            }
+            matcher.appendTail(result);
+
+            return result.toString();
+        } catch (Exception e) {
+            LOGGER.warn("Failed to convert matches() to contains(): xpath={}, error={}", xpath, e.getMessage());
+            return xpath;
+        }
+    }
+
+    private static String compactErrorMessage(Throwable e) {
+        if (e == null) return "";
+        String msg = e.getMessage();
+        if (msg != null && msg.trim().length() > 0) return msg.trim();
+        return e.getClass().getName();
+    }
+
+    /**
+     * Best-effort recovery for UIAutomator2: wake screen -> restart uia server -> recreate driver.
+     * This is intentionally conservative to avoid infinite loops; only triggers for connection-style errors.
+     */
+    private void recoverUiaIfNeeded(Throwable e) {
+        if (iDevice == null) return;
+        if (!isUiaConnectionError(e)) return;
+        long now = System.currentTimeMillis();
+        // 自愈冷却时间：自愈需要时间（重启 Server + 重建连接），太频繁会适得其反
+        long sinceLast = now - lastUiaRecoverTimeMs;
+        if (sinceLast < UIA_RECOVER_COOLDOWN_MS) {
+            LOGGER.debug("Skip UIA recover (cooldown): device={}, sinceLast={}ms, cooldown={}ms, reason={}",
+                    iDevice.getSerialNumber(), sinceLast, UIA_RECOVER_COOLDOWN_MS, compactErrorMessage(e));
+            return;
+        }
+        lastUiaRecoverTimeMs = now;
+        String reason = compactErrorMessage(e);
+        log.sendStepLog(StepType.WARN, "UIAutomator2 响应超时，尝试自愈", reason);
+        LOGGER.warn("UIA recover start: device={}, uiaPort={}, reason={}", iDevice.getSerialNumber(), uiaPort, reason);
+        try {
+            AndroidDeviceBridgeTool.wakeUpScreen(iDevice);
+            Thread.sleep(600);
+        } catch (Exception ignored) {
+        }
+        // If we know the local forwarded port, restart uia server and driver
+        if (uiaPort > 0) {
+            try {
+                // 先停止心跳线程，避免在恢复过程中干扰
+                stopUiaHeartbeat();
+
+                // close old driver best-effort with timeout; it may already be half-broken
+                try {
+                    if (androidDriver != null) {
+                        final AndroidDriver driverToClose = androidDriver;
+                        androidDriver = null; // 立即置 null，让心跳线程能检测到
+                        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+                        java.util.concurrent.Future<?> future = executor.submit(() -> {
+                            try {
+                                driverToClose.closeDriver();
+                            } catch (Exception ignored) {
+                            }
+                        });
+                        try {
+                            future.get(3, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (java.util.concurrent.TimeoutException te) {
+                            future.cancel(true);
+                        } finally {
+                            executor.shutdownNow();
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+                long restartStart = System.currentTimeMillis();
+                int startedPort = AndroidDeviceBridgeTool.startUiaServer(iDevice, uiaPort);
+                long restartCost = System.currentTimeMillis() - restartStart;
+                LOGGER.warn("UIA server restarted: device={}, requestedPort={}, startedPort={}, cost={}ms",
+                        iDevice.getSerialNumber(), uiaPort, startedPort, restartCost);
+                // recreate driver
+                long driverStart = System.currentTimeMillis();
+                startAndroidDriver(iDevice, uiaPort);
+                long driverCost = System.currentTimeMillis() - driverStart;
+                LOGGER.warn("UIA driver recreated: device={}, port={}, cost={}ms", iDevice.getSerialNumber(), uiaPort, driverCost);
+
+                // 自愈后等待连接稳定 - Android 16 需要更长时间
+                try {
+                    long stabilizeWait = (currentApiLevel >= 36) ? 3500 : 1500;
+                    if (isWifiAdbConnection && currentApiLevel >= 36) {
+                        stabilizeWait = 5000; // WiFi + Android 16: 更长等待
+                    }
+                    Thread.sleep(stabilizeWait);
+                    // 额外验证连接是否真正可用
+                    if (androidDriver != null) {
+                        androidDriver.getSessionId();
+                        // Android 16 再次验证，确保稳定
+                        if (currentApiLevel >= 36) {
+                            Thread.sleep(500);
+                            androidDriver.getPageSource(); // 更重的验证
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                log.sendStepLog(StepType.INFO, "UIAutomator2 自愈完成", "");
+            } catch (Exception ex) {
+                log.sendStepLog(StepType.WARN, "UIAutomator2 自愈失败", compactErrorMessage(ex));
+                LOGGER.warn("UIA recover failed: device={}, uiaPort={}, reason={}, error={}",
+                        iDevice.getSerialNumber(), uiaPort, reason, compactErrorMessage(ex));
+            }
+        } else {
+            LOGGER.warn("UIA recover skipped: device={}, uiaPort is unknown/0, reason={}", iDevice.getSerialNumber(), reason);
+        }
     }
 
     public void switchWindowMode(HandleContext handleContext, boolean isMulti) throws SonicRespException {
@@ -193,28 +595,75 @@ public class AndroidStepHandler {
      * @date 2021/8/16 20:21
      */
     public void closeAndroidDriver() {
+        // 首先停止心跳保活线程
+        stopUiaHeartbeat();
+
+        // 关闭 driver 的最大超时时间（秒），防止 HTTP 请求阻塞导致锁无法释放
+        final int CLOSE_DRIVER_TIMEOUT_SECONDS = 10;
+
         try {
             if (chromeDriver != null) {
                 chromeDriver.quit();
             }
             if (pocoDriver != null) {
                 pocoDriver.closeDriver();
-                AndroidDeviceBridgeTool.removeForward(iDevice, pocoPort, targetPort);
+                if (iDevice != null) {
+                    AndroidDeviceBridgeTool.removeForward(iDevice, pocoPort, targetPort);
+                }
                 pocoDriver = null;
             }
             if (androidDriver != null) {
-                androidDriver.closeDriver();
-                log.sendStepLog(StepType.PASS, "退出连接设备", "");
+                // 使用超时包装，防止 closeDriver 阻塞过久
+                java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+                // 保存引用，因为后面要置 null
+                final AndroidDriver driverToClose = androidDriver;
+                java.util.concurrent.Future<?> future = executor.submit(() -> {
+                    try {
+                        driverToClose.closeDriver();
+                    } catch (Exception e) {
+                        // 忽略关闭时的异常，仅记录日志
+                    }
+                });
+                // 立即置 null，让心跳线程能检测到 driver 已关闭
+                androidDriver = null;
+                try {
+                    future.get(CLOSE_DRIVER_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
+                    log.sendStepLog(StepType.PASS, "退出连接设备", "");
+                } catch (java.util.concurrent.TimeoutException e) {
+                    future.cancel(true);
+                    log.sendStepLog(StepType.WARN, "关闭 Driver 超时，强制跳过",
+                            "closeDriver 操作超过 " + CLOSE_DRIVER_TIMEOUT_SECONDS + " 秒未响应");
+                } catch (Exception e) {
+                    log.sendStepLog(StepType.WARN, "关闭 Driver 异常", e.getMessage());
+                } finally {
+                    executor.shutdownNow();
+                }
             }
         } catch (Exception e) {
             log.sendStepLog(StepType.WARN, "测试终止异常！请检查设备连接状态", e.fillInStackTrace().toString());
             setResultDetailStatus(ResultDetailStatus.WARN);
         } finally {
-            Thread s = AndroidThreadMap.getMap().get(String.format("%s-uia-thread", iDevice.getSerialNumber()));
-            if (s != null) {
-                s.interrupt();
+            try {
+                if (iDevice != null) {
+                    // 在设备端彻底停止 instrument 进程，防止 Android 16 上残留进程累积
+                    AndroidDeviceBridgeTool.executeCommand(iDevice, "am force-stop io.appium.uiautomator2.server", 5000, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    AndroidDeviceBridgeTool.executeCommand(iDevice, "am force-stop io.appium.uiautomator2.server.test", 5000, java.util.concurrent.TimeUnit.MILLISECONDS);
+
+                    String uiaThreadKey = String.format("%s-uia-thread", iDevice.getSerialNumber());
+                    Thread s = AndroidThreadMap.getMap().get(uiaThreadKey);
+                    if (s != null) {
+                        s.interrupt();
+                        // 从 Map 中移除线程引用，防止内存泄漏
+                        AndroidThreadMap.getMap().remove(uiaThreadKey);
+                    }
+                    AndroidDeviceBridgeTool.clearWebView(iDevice);
+                    // 清理 UIAutomator2 端口转发，防止资源泄漏
+                    if (uiaPort > 0) {
+                        AndroidDeviceBridgeTool.removeForward(iDevice, uiaPort, 6790);
+                    }
+                }
+            } catch (Exception ignored) {
             }
-            AndroidDeviceBridgeTool.clearWebView(iDevice);
         }
     }
 
@@ -245,6 +694,217 @@ public class AndroidStepHandler {
     }
 
     private boolean isLockStatus = false;
+
+    /**
+     * 通用 PIN 处理（推荐在自定义脚本里调用）：
+     * - 锁屏(Keyguard)：仅此处允许上滑；上滑后仍锁才输入 PIN
+     * - 安装/策略弹出的 ConfirmLockPassword：不做上滑；优先用无坐标输入（text/keyevent），必要时再用 UIA 点击/网格点兜底
+     *
+     * @return true 表示执行了“可能需要的 PIN 流程”且页面不再停留在锁屏/确认页；false 表示无需 PIN 或失败
+     */
+    public boolean enterPinIfNeededByUia(String pin) {
+        if (iDevice == null) return false;
+
+        // 1) Keyguard lock screen (ADB only)
+        if (AndroidDeviceBridgeTool.isKeyguardLocked(iDevice)) {
+            return AndroidDeviceBridgeTool.unlockByPinIfLocked(iDevice, pin);
+        }
+
+        // 2) Credential confirmation screen
+        if (!AndroidDeviceBridgeTool.isCredentialConfirmationShowing(iDevice)) {
+            return false;
+        }
+        if (androidDriver == null) {
+            // fallback without driver
+            return AndroidDeviceBridgeTool.enterPinIfCredentialConfirmation(iDevice, pin);
+        }
+
+        String purePin = pin == null ? "" : pin.trim();
+        if (purePin.length() == 0) return false;
+        for (int i = 0; i < purePin.length(); i++) {
+            char c = purePin.charAt(i);
+            if (c < '0' || c > '9') return false;
+        }
+
+        // Prefer non-coordinate input first to avoid "tap offset" on some OEM keypads.
+        // 1) best-effort focus input field
+        focusCredentialInputIfExists();
+        // 2) clear possible leftover input (avoid appending digits on retries)
+        clearFocusedInputBestEffort(Math.min(16, purePin.length() + 8));
+        // 3) type digits (no enter key - system auto-submits after PIN input)
+        AndroidDeviceBridgeTool.inputDigitsByText(iDevice, purePin, false);
+        postSubmitForCredentialConfirmation();
+        if (!AndroidDeviceBridgeTool.isCredentialConfirmationShowing(iDevice)) return true;
+
+        // Retry with keyevents (some ROMs block "input text")
+        focusCredentialInputIfExists();
+        clearFocusedInputBestEffort(Math.min(16, purePin.length() + 8));
+        AndroidDeviceBridgeTool.inputPinByKeyeventSlow(iDevice, purePin, false, 120);
+        postSubmitForCredentialConfirmation();
+        if (!AndroidDeviceBridgeTool.isCredentialConfirmationShowing(iDevice)) return true;
+
+        // If still showing, try UIA-click digit buttons (more stable than grid taps).
+        if (tapPinByUiaDigitButtons(purePin)) {
+            postSubmitForCredentialConfirmation();
+            if (!AndroidDeviceBridgeTool.isCredentialConfirmationShowing(iDevice)) return true;
+        }
+
+        // Last resort: grid tap by keyboard bounds (may be inaccurate on some ROMs).
+        try {
+            AndroidElement keyboard = androidDriver.findElement(AndroidSelector.Id, "com.android.settings:id/keyboard_num", 1);
+            String bounds = keyboard.getAttribute("bounds");
+            if (bounds != null && bounds.contains("][")) {
+                tapPinByKeyboardBounds(bounds, purePin);
+                postSubmitForCredentialConfirmation();
+                return !AndroidDeviceBridgeTool.isCredentialConfirmationShowing(iDevice);
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void clickIfExists(String id) {
+        try {
+            AndroidElement e = androidDriver.findElement(AndroidSelector.Id, id, 1);
+            if (e != null) e.click();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void focusCredentialInputIfExists() {
+        try {
+            AndroidElement input = androidDriver.findElement(AndroidSelector.Id, "com.android.settings:id/input_view", 1);
+            if (input != null) {
+                input.click();
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+        // Some ROMs use different ids; keep best-effort and non-fatal.
+        try {
+            AndroidElement input = androidDriver.findElement(AndroidSelector.Id, "com.android.settings:id/password_entry", 1);
+            if (input != null) input.click();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void clearFocusedInputBestEffort(int times) {
+        int t = Math.max(0, times);
+        for (int i = 0; i < t; i++) {
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "input keyevent 67", 2000, java.util.concurrent.TimeUnit.MILLISECONDS); // DEL
+            try {
+                Thread.sleep(30);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    }
+
+    private void postSubmitForCredentialConfirmation() {
+        // try confirm buttons if present (no enter keys - system auto-submits after PIN input)
+        clickIfExists("com.android.settings:id/menu_continue");
+        clickIfExists("android:id/button1");
+        try {
+            Thread.sleep(550);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Try clicking digit buttons by UIA (text/description). This avoids coordinate mapping issues on some ROMs.
+     */
+    private boolean tapPinByUiaDigitButtons(String pin) {
+        if (pin == null || pin.isBlank()) return false;
+        try {
+            for (int i = 0; i < pin.length(); i++) {
+                String d = String.valueOf(pin.charAt(i));
+                AndroidElement key = null;
+                try {
+                    key = androidDriver.findElement(
+                            AndroidSelector.UIAUTOMATOR,
+                            "new UiSelector().text(\"" + d + "\").clickable(true)",
+                            1
+                    );
+                } catch (Throwable ignored) {
+                }
+                if (key == null) {
+                    try {
+                        key = androidDriver.findElement(
+                                AndroidSelector.UIAUTOMATOR,
+                                "new UiSelector().description(\"" + d + "\").clickable(true)",
+                                1
+                        );
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (key == null) return false;
+                key.click();
+                try {
+                    Thread.sleep(80);
+                } catch (InterruptedException ignored) {
+                }
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void tapPinByKeyboardBounds(String bounds, String pin) {
+        int[] b = parseBounds(bounds);
+        if (b == null) return;
+        int x1 = b[0], y1 = b[1], x2 = b[2], y2 = b[3];
+        int w = Math.max(1, x2 - x1);
+        int h = Math.max(1, y2 - y1);
+        // Inset a bit to avoid container padding/borders on OEM ROMs.
+        int insetX = Math.max(0, (int) (w * 0.04));
+        int insetY = Math.max(0, (int) (h * 0.04));
+        x1 += insetX;
+        x2 -= insetX;
+        y1 += insetY;
+        y2 -= insetY;
+        w = Math.max(1, x2 - x1);
+        h = Math.max(1, y2 - y1);
+        double cellW = w / 3.0;
+        double cellH = h / 4.0;
+        if (cellW <= 1 || cellH <= 1) return;
+
+        for (int i = 0; i < pin.length(); i++) {
+            int d = pin.charAt(i) - '0';
+            int row;
+            int col;
+            if (d == 0) {
+                row = 3;
+                col = 1;
+            } else {
+                row = (d - 1) / 3;
+                col = (d - 1) % 3;
+            }
+            int tapX = (int) Math.round(x1 + col * cellW + cellW / 2.0);
+            int tapY = (int) Math.round(y1 + row * cellH + cellH / 2.0);
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "input tap " + tapX + " " + tapY, 2000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    }
+
+    private static int[] parseBounds(String bounds) {
+        try {
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile("\\[(\\d+),(\\d+)]\\[(\\d+),(\\d+)]");
+            java.util.regex.Matcher m = p.matcher(bounds);
+            if (!m.find()) return null;
+            return new int[]{
+                    Integer.parseInt(m.group(1)),
+                    Integer.parseInt(m.group(2)),
+                    Integer.parseInt(m.group(3)),
+                    Integer.parseInt(m.group(4))
+            };
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /**
      * @author ZhouYiXun
@@ -278,7 +938,7 @@ public class AndroidStepHandler {
      * @date 2021/8/16 23:16
      */
     public boolean getBattery() {
-        String battery = AndroidDeviceBridgeTool.executeCommand(iDevice, "dumpsys battery");
+        String battery = AndroidDeviceBridgeTool.executeCommand(iDevice, "dumpsys battery", 5000, java.util.concurrent.TimeUnit.MILLISECONDS);
         String realLevel = battery.substring(battery.indexOf("level")).trim();
         int level = BytesTool.getInt(realLevel.substring(7, realLevel.indexOf("\n")));
         if (level <= 10) {
@@ -490,7 +1150,12 @@ public class AndroidStepHandler {
         handleContext.setStepDes("解锁屏幕");
         handleContext.setDetail("");
         try {
-            AndroidDeviceBridgeTool.pressKey(iDevice, AndroidKey.POWER);
+            // 使用 WAKEUP 键 (keyevent 224) 唤醒屏幕
+            // WAKEUP 键只会唤醒屏幕，不会像 POWER 键那样切换屏幕状态
+            // 即使屏幕已经是亮的，发送 WAKEUP 也不会锁屏
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "input keyevent 224");
+            // 等待屏幕完全亮起
+            Thread.sleep(500);
         } catch (Exception e) {
             handleContext.setE(e);
         }
@@ -572,11 +1237,23 @@ public class AndroidStepHandler {
         String s = "";
         handleContext.setStepDes("获取" + des + "文本");
         handleContext.setDetail("获取" + selector + ":" + pathValue + "文本");
-        try {
-            s = findEle(selector, pathValue).getText();
-            log.sendStepLog(StepType.INFO, "", "文本获取结果: " + s);
-        } catch (Exception e) {
-            handleContext.setE(e);
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                s = findEle(selector, pathValue).getText();
+                log.sendStepLog(StepType.INFO, "", "文本获取结果: " + s);
+                return s;
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("getText connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return s;
+            }
         }
         return s;
     }
@@ -619,10 +1296,22 @@ public class AndroidStepHandler {
     public void click(HandleContext handleContext, String des, String selector, String pathValue) {
         handleContext.setStepDes("点击" + des);
         handleContext.setDetail("点击" + selector + ": " + pathValue);
-        try {
-            findEle(selector, pathValue).click();
-        } catch (Exception e) {
-            handleContext.setE(e);
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                findEle(selector, pathValue).click();
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("click connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
@@ -630,10 +1319,23 @@ public class AndroidStepHandler {
         keys = TextHandler.replaceTrans(keys, globalParams);
         handleContext.setStepDes("对" + des + "输入内容");
         handleContext.setDetail("对" + selector + ": " + pathValue + " 输入: " + keys);
-        try {
-            findEle(selector, pathValue).sendKeys(keys);
-        } catch (Exception e) {
-            handleContext.setE(e);
+        final String finalKeys = keys;
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                findEle(selector, pathValue).sendKeys(finalKeys);
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("sendKeys connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
@@ -641,14 +1343,27 @@ public class AndroidStepHandler {
         keys = TextHandler.replaceTrans(keys, globalParams);
         handleContext.setStepDes("对" + des + "输入内容");
         handleContext.setDetail("对" + selector + ": " + pathValue + " 输入: " + keys);
-        try {
-            AndroidElement androidElement = findEle(selector, pathValue);
-            if (androidElement != null) {
-                androidElement.click();
-                androidDriver.sendKeys(keys);
+        final String finalKeys = keys;
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                AndroidElement androidElement = findEle(selector, pathValue);
+                if (androidElement != null) {
+                    androidElement.click();
+                    androidDriver.sendKeys(finalKeys);
+                }
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("sendKeysByActions connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
             }
-        } catch (Exception e) {
-            handleContext.setE(e);
         }
     }
 
@@ -736,18 +1451,29 @@ public class AndroidStepHandler {
     }
 
     public void swipe(HandleContext handleContext, String des, String selector, String pathValue, String des2, String selector2, String pathValue2) {
-        try {
-            AndroidElement webElement = findEle(selector, pathValue);
-            AndroidElement webElement2 = findEle(selector2, pathValue2);
-            int x1 = webElement.getRect().getX();
-            int y1 = webElement.getRect().getY();
-            int x2 = webElement2.getRect().getX();
-            int y2 = webElement2.getRect().getY();
-            handleContext.setStepDes("滑动拖拽" + des + "到" + des2);
-            handleContext.setDetail("拖动坐标(" + x1 + "," + y1 + ")到(" + x2 + "," + y2 + ")");
-            AndroidTouchHandler.swipe(iDevice, x1, y1, x2, y2);
-        } catch (Exception e) {
-            handleContext.setE(e);
+        handleContext.setStepDes("滑动拖拽" + des + "到" + des2);
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                AndroidElement webElement = findEle(selector, pathValue);
+                AndroidElement webElement2 = findEle(selector2, pathValue2);
+                int x1 = webElement.getRect().getX();
+                int y1 = webElement.getRect().getY();
+                int x2 = webElement2.getRect().getX();
+                int y2 = webElement2.getRect().getY();
+                handleContext.setDetail("拖动坐标(" + x1 + "," + y1 + ")到(" + x2 + "," + y2 + ")");
+                AndroidTouchHandler.swipe(iDevice, x1, y1, x2, y2);
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("swipe connection error -> recover and retry: device={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(), compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
@@ -770,18 +1496,29 @@ public class AndroidStepHandler {
     }
 
     public void dragByEle(HandleContext handleContext, String des, String selector, String pathValue, String des2, String selector2, String pathValue2) {
-        try {
-            AndroidElement webElement = findEle(selector, pathValue);
-            AndroidElement webElement2 = findEle(selector2, pathValue2);
-            int x1 = webElement.getRect().getX();
-            int y1 = webElement.getRect().getY();
-            int x2 = webElement2.getRect().getX();
-            int y2 = webElement2.getRect().getY();
-            handleContext.setStepDes("模拟长按「" + des + "」然后拖拽移动到「" + des2 + "」松手");
-            handleContext.setDetail("拖拽坐标(" + x1 + "," + y1 + ")的元素移动到(" + x2 + "," + y2 + ")");
-            AndroidTouchHandler.drag(iDevice, x1, y1, x2, y2);
-        } catch (SonicRespException e) {
-            handleContext.setE(e);
+        handleContext.setStepDes("模拟长按「" + des + "」然后拖拽移动到「" + des2 + "」松手");
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                AndroidElement webElement = findEle(selector, pathValue);
+                AndroidElement webElement2 = findEle(selector2, pathValue2);
+                int x1 = webElement.getRect().getX();
+                int y1 = webElement.getRect().getY();
+                int x2 = webElement2.getRect().getX();
+                int y2 = webElement2.getRect().getY();
+                handleContext.setDetail("拖拽坐标(" + x1 + "," + y1 + ")的元素移动到(" + x2 + "," + y2 + ")");
+                AndroidTouchHandler.drag(iDevice, x1, y1, x2, y2);
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("dragByEle connection error -> recover and retry: device={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(), compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
@@ -889,27 +1626,51 @@ public class AndroidStepHandler {
     public void longPress(HandleContext handleContext, String des, String selector, String pathValue, int time) {
         handleContext.setStepDes("长按" + des);
         handleContext.setDetail("长按控件元素" + time + "毫秒 ");
-        try {
-            AndroidElement webElement = findEle(selector, pathValue);
-            int x = webElement.getRect().getX();
-            int y = webElement.getRect().getY();
-            int width = webElement.getRect().getWidth();
-            int height = webElement.getRect().getHeight();
-            int centerX = x + (int) Math.ceil(width / 2.0);
-            int centerY = y + (int) Math.ceil(height / 2.0);
-            AndroidTouchHandler.longPress(iDevice, centerX, centerY, time);
-        } catch (Exception e) {
-            handleContext.setE(e);
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                AndroidElement webElement = findEle(selector, pathValue);
+                int x = webElement.getRect().getX();
+                int y = webElement.getRect().getY();
+                int width = webElement.getRect().getWidth();
+                int height = webElement.getRect().getHeight();
+                int centerX = x + (int) Math.ceil(width / 2.0);
+                int centerY = y + (int) Math.ceil(height / 2.0);
+                AndroidTouchHandler.longPress(iDevice, centerX, centerY, time);
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("longPress connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
     public void clear(HandleContext handleContext, String des, String selector, String pathValue) {
         handleContext.setStepDes("清空" + des);
         handleContext.setDetail("清空" + selector + ": " + pathValue);
-        try {
-            findEle(selector, pathValue).clear();
-        } catch (Exception e) {
-            handleContext.setE(e);
+        // 添加自愈重试逻辑：当 UIAutomator2 连接断开时，自愈后重试一次
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                findEle(selector, pathValue).clear();
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("clear connection error -> recover and retry: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pathValue, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue; // 自愈后重试
+                }
+                handleContext.setE(e);
+                return;
+            }
         }
     }
 
@@ -1311,20 +2072,33 @@ public class AndroidStepHandler {
     }
 
     public void errorScreen() {
-        try {
-            File folder = new File("test-output");
-            if (!folder.exists()) {
-                folder.mkdirs();
+        int maxRetry = 2;
+        for (int retry = 0; retry <= maxRetry; retry++) {
+            try {
+                if (retry > 0) {
+                    // 尝试自愈后重试
+                    Thread.sleep(500);
+                }
+                File folder = new File("test-output");
+                if (!folder.exists()) {
+                    folder.mkdirs();
+                }
+                byte[] bt = androidDriver.screenshot();
+                File output = new File(folder + File.separator + UUID.randomUUID() + ".png");
+                FileImageOutputStream imageOutput = new FileImageOutputStream(output);
+                imageOutput.write(bt, 0, bt.length);
+                imageOutput.close();
+                log.sendStepLog(StepType.WARN, "获取异常截图", UploadTools
+                        .upload(output, "imageFiles"));
+                return; // 成功则退出
+            } catch (Exception e) {
+                if (retry == 0 && isUiaConnectionError(e)) {
+                    // 首次失败且是连接错误，尝试自愈
+                    recoverUiaIfNeeded(e);
+                } else if (retry >= maxRetry) {
+                    log.sendStepLog(StepType.ERROR, "捕获截图失败", e.getMessage() != null ? e.getMessage() : "");
+                }
             }
-            byte[] bt = androidDriver.screenshot();
-            File output = new File(folder + File.separator + UUID.randomUUID() + ".png");
-            FileImageOutputStream imageOutput = new FileImageOutputStream(output);
-            imageOutput.write(bt, 0, bt.length);
-            imageOutput.close();
-            log.sendStepLog(StepType.WARN, "获取异常截图", UploadTools
-                    .upload(output, "imageFiles"));
-        } catch (Exception e) {
-            log.sendStepLog(StepType.ERROR, "捕获截图失败", "");
         }
     }
 
@@ -1332,21 +2106,35 @@ public class AndroidStepHandler {
         handleContext.setStepDes("获取截图");
         handleContext.setDetail("");
         String url;
-        try {
-            File folder = new File("test-output");
-            if (!folder.exists()) {
-                folder.mkdirs();
+        // 高版本 Android 可能因为临时超时导致截图失败，增加重试机制
+        int maxRetry = 3;
+        Exception lastException = null;
+        for (int retry = 0; retry < maxRetry; retry++) {
+            try {
+                // 首次失败后尝试唤醒屏幕
+                if (retry > 0) {
+                    AndroidDeviceBridgeTool.wakeUpScreen(iDevice);
+                    Thread.sleep(500);
+                    log.sendStepLog(StepType.WARN, "截图失败，重试第 " + retry + " 次...", "");
+                }
+                File folder = new File("test-output");
+                if (!folder.exists()) {
+                    folder.mkdirs();
+                }
+                File output = new File(folder + File.separator + iDevice.getSerialNumber() + Calendar.getInstance().getTimeInMillis() + ".png");
+                byte[] bt = androidDriver.screenshot();
+                FileImageOutputStream imageOutput = new FileImageOutputStream(output);
+                imageOutput.write(bt, 0, bt.length);
+                imageOutput.close();
+                url = UploadTools.upload(output, "imageFiles");
+                handleContext.setDetail(url);
+                return; // 成功则退出
+            } catch (Exception e) {
+                lastException = e;
             }
-            File output = new File(folder + File.separator + iDevice.getSerialNumber() + Calendar.getInstance().getTimeInMillis() + ".png");
-            byte[] bt = androidDriver.screenshot();
-            FileImageOutputStream imageOutput = new FileImageOutputStream(output);
-            imageOutput.write(bt, 0, bt.length);
-            imageOutput.close();
-            url = UploadTools.upload(output, "imageFiles");
-            handleContext.setDetail(url);
-        } catch (Exception e) {
-            handleContext.setE(e);
         }
+        // 所有重试都失败
+        handleContext.setE(lastException);
     }
 
     public Set<String> getWebView() {
@@ -2110,16 +2898,82 @@ public class AndroidStepHandler {
 
     public AndroidElement findEle(String selector, String pathValue, Integer retryTime) throws SonicRespException {
         AndroidElement we = null;
+        String originalPathValue = pathValue;
         pathValue = TextHandler.replaceTrans(pathValue, globalParams);
-        switch (selector) {
-            case "androidIterator" -> we = androidDriver.findElement(pathValue);
-            case "id" -> we = androidDriver.findElement(AndroidSelector.Id, pathValue, retryTime);
-            case "accessibilityId" -> we = androidDriver.findElement(AndroidSelector.ACCESSIBILITY_ID, pathValue, retryTime);
-            case "xpath" -> we = androidDriver.findElement(AndroidSelector.XPATH, pathValue, retryTime);
-            case "className" -> we = androidDriver.findElement(AndroidSelector.CLASS_NAME, pathValue, retryTime);
-            case "androidUIAutomator" -> we = androidDriver.findElement(AndroidSelector.UIAUTOMATOR, pathValue, retryTime);
-            default ->
-                    log.sendStepLog(StepType.ERROR, "查找控件元素失败", "这个控件元素类型: " + selector + " 不存在!!!");
+        // 调试日志：检查变量替换是否生效
+        if (!originalPathValue.equals(pathValue)) {
+            // 输出详细信息，包括字符串长度，用于排查隐藏字符问题
+            log.sendStepLog(StepType.INFO, "变量替换成功",
+                "原始值[长度=" + originalPathValue.length() + "]: " + originalPathValue +
+                " -> 替换后[长度=" + pathValue.length() + "]: " + pathValue);
+            // 输出实际传给驱动的 xpath
+            log.sendStepLog(StepType.INFO, "实际查找xpath", "selector=" + selector + ", pathValue=" + pathValue);
+        } else if (originalPathValue.contains("{{")) {
+            log.sendStepLog(StepType.WARN, "变量替换失败", "原始值: " + originalPathValue + ", globalParams: " + globalParams.toJSONString());
+        }
+
+        // Android 16+ 使用 XPath1，需要将 matches() 转换为 contains()
+        if ("xpath".equals(selector) && enforceXPath1Enabled && pathValue != null && pathValue.contains("matches(")) {
+            String converted = convertMatchesToContains(pathValue);
+            if (!converted.equals(pathValue)) {
+                log.sendStepLog(StepType.INFO, "XPath1 兼容转换",
+                    "matches() -> contains(): " + converted);
+                pathValue = converted;
+            }
+        }
+
+        // Android 16 + WiFi ADB: 操作前小延迟，减轻 UIA server 压力
+        if (currentApiLevel >= 36 && isWifiAdbConnection) {
+            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+        }
+
+        // One extra attempt for connection-style failures (screen off / uia server stalled)
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                switch (selector) {
+                    case "androidIterator" -> we = androidDriver.findElement(pathValue);
+                    case "id" -> we = androidDriver.findElement(AndroidSelector.Id, pathValue, retryTime);
+                    case "accessibilityId" -> we = androidDriver.findElement(AndroidSelector.ACCESSIBILITY_ID, pathValue, retryTime);
+                    case "xpath" -> we = androidDriver.findElement(AndroidSelector.XPATH, pathValue, retryTime);
+                    case "className" -> we = androidDriver.findElement(AndroidSelector.CLASS_NAME, pathValue, retryTime);
+                    case "androidUIAutomator" -> we = androidDriver.findElement(AndroidSelector.UIAUTOMATOR, pathValue, retryTime);
+                    default ->
+                            log.sendStepLog(StepType.ERROR, "查找控件元素失败", "这个控件元素类型: " + selector + " 不存在!!!");
+                }
+                return we;
+            } catch (SonicRespException e) {
+                // Some devices/Android versions can't use XPath2 due to hidden API restrictions.
+                // Auto fallback to XPath1 once to improve stability.
+                if (attempt == 0 && tryEnableEnforceXPath1(selector, e)) {
+                    continue;
+                }
+                // 检查 SonicRespException 是否也是连接/session 错误，需要自愈
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    String pv = pathValue == null ? "" : pathValue;
+                    String pvShort = pv.length() > 120 ? pv.substring(0, 120) + "..." : pv;
+                    LOGGER.warn("findEle SonicRespException connection error -> recover: device={}, selector={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, pvShort, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue;
+                }
+                throw e;
+            } catch (Throwable e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    String pv = pathValue == null ? "" : pathValue;
+                    String pvShort = pv.length() > 120 ? pv.substring(0, 120) + "..." : pv;
+                    LOGGER.warn("findEle connection error -> recover: device={}, selector={}, retryTime={}, pathLen={}, path={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(),
+                            selector, retryTime, pv.length(), pvShort, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue;
+                }
+                // keep original exception style
+                if (e instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new SonicRespException(compactErrorMessage(e));
+            }
         }
         return we;
     }
@@ -2163,16 +3017,53 @@ public class AndroidStepHandler {
     public List<AndroidElement> findEleList(String selector, String pathValue) throws SonicRespException {
         List<AndroidElement> androidElements = null;
         pathValue = TextHandler.replaceTrans(pathValue, globalParams);
-        switch (selector) {
-            case "id" -> androidElements = androidDriver.findElementList(AndroidSelector.Id, pathValue);
-            case "accessibilityId" ->
-                    androidElements = androidDriver.findElementList(AndroidSelector.ACCESSIBILITY_ID, pathValue);
-            case "xpath" -> androidElements = androidDriver.findElementList(AndroidSelector.XPATH, pathValue);
-            case "className" -> androidElements = androidDriver.findElementList(AndroidSelector.CLASS_NAME, pathValue);
-            case "androidUIAutomator" ->
-                    androidElements = androidDriver.findElementList(AndroidSelector.UIAUTOMATOR, pathValue);
-            default ->
-                    log.sendStepLog(StepType.ERROR, "查找控件元素数组失败", "这个控件元素类型: " + selector + " 不存在!!!");
+
+        // Android 16+ 使用 XPath1，需要将 matches() 转换为 contains()
+        if ("xpath".equals(selector) && enforceXPath1Enabled && pathValue != null && pathValue.contains("matches(")) {
+            String converted = convertMatchesToContains(pathValue);
+            if (!converted.equals(pathValue)) {
+                log.sendStepLog(StepType.INFO, "XPath1 兼容转换",
+                    "matches() -> contains(): " + converted);
+                pathValue = converted;
+            }
+        }
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                switch (selector) {
+                    case "id" -> androidElements = androidDriver.findElementList(AndroidSelector.Id, pathValue);
+                    case "accessibilityId" ->
+                            androidElements = androidDriver.findElementList(AndroidSelector.ACCESSIBILITY_ID, pathValue);
+                    case "xpath" -> androidElements = androidDriver.findElementList(AndroidSelector.XPATH, pathValue);
+                    case "className" -> androidElements = androidDriver.findElementList(AndroidSelector.CLASS_NAME, pathValue);
+                    case "androidUIAutomator" ->
+                            androidElements = androidDriver.findElementList(AndroidSelector.UIAUTOMATOR, pathValue);
+                    default ->
+                            log.sendStepLog(StepType.ERROR, "查找控件元素数组失败", "这个控件元素类型: " + selector + " 不存在!!!");
+                }
+                return androidElements;
+            } catch (SonicRespException e) {
+                if (attempt == 0 && tryEnableEnforceXPath1(selector, e)) {
+                    continue;
+                }
+                // 检查 SonicRespException 是否是连接/session 错误
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    LOGGER.warn("findEleList SonicRespException connection error -> recover: device={}, selector={}, err={}",
+                            iDevice == null ? "" : iDevice.getSerialNumber(), selector, compactErrorMessage(e));
+                    recoverUiaIfNeeded(e);
+                    continue;
+                }
+                throw e;
+            } catch (Throwable e) {
+                if (attempt == 0 && isUiaConnectionError(e)) {
+                    recoverUiaIfNeeded(e);
+                    continue;
+                }
+                if (e instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new SonicRespException(compactErrorMessage(e));
+            }
         }
         return androidElements;
     }

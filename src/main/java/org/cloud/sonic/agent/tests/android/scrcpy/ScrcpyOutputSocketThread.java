@@ -23,6 +23,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import static org.cloud.sonic.agent.tools.BytesTool.sendByte;
 
@@ -56,15 +57,23 @@ public class ScrcpyOutputSocketThread extends Thread {
 
     @Override
     public void run() {
-        while (scrcpyInputSocketThread.isAlive()) {
-            BlockingQueue<byte[]> dataQueue = scrcpyInputSocketThread.getDataQueue();
-            byte[] buffer = new byte[0];
+        log.info("scrcpy output thread started");
+        BlockingQueue<byte[]> dataQueue = scrcpyInputSocketThread.getDataQueue();
+        int frameCount = 0;
+        
+        while (scrcpyInputSocketThread.isAlive() && session != null && session.isOpen()) {
             try {
-                buffer = dataQueue.take();
+                // 使用较短的超时，快速响应线程状态变化
+                byte[] buffer = dataQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (buffer != null && buffer.length > 0) {
+                    sendByte(session, buffer);
+                    frameCount++;
+                }
             } catch (InterruptedException e) {
-                log.debug("scrcpy was interrupted：", e);
+                log.debug("scrcpy output interrupted");
+                break;
             }
-            sendByte(session, buffer);
         }
+        log.info("scrcpy output thread exited, frames sent: {}", frameCount);
     }
 }

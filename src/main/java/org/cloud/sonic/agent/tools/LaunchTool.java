@@ -71,16 +71,20 @@ public class LaunchTool implements ApplicationRunner {
 
     @PreDestroy
     public void destroy() {
-        for (String key : GlobalProcessMap.getMap().keySet()) {
-            Process ps = GlobalProcessMap.getMap().get(key);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
+        // 清理所有全局进程
+        for (String key : new java.util.ArrayList<>(GlobalProcessMap.getMap().keySet())) {
+            GlobalProcessMap.terminateAndRemove(key);
         }
-        for (String key : IOSProcessMap.getMap().keySet()) {
-            List<Process> ps = IOSProcessMap.getMap().get(key);
-            for (Process p : ps) {
-                p.children().forEach(ProcessHandle::destroy);
-                p.destroy();
+        // 清理所有 iOS 进程
+        for (String key : new java.util.ArrayList<>(IOSProcessMap.getMap().keySet())) {
+            List<Process> ps = IOSProcessMap.getMap().remove(key);
+            if (ps != null) {
+                for (Process p : ps) {
+                    if (p != null) {
+                        p.children().forEach(ProcessHandle::destroy);
+                        p.destroy();
+                    }
+                }
             }
         }
         log.info("Release done!");

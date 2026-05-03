@@ -45,9 +45,9 @@ import org.cloud.sonic.agent.tools.file.DownloadTool;
 import org.cloud.sonic.agent.tools.file.UploadTools;
 import org.cloud.sonic.agent.transport.TransportWorker;
 import org.cloud.sonic.driver.common.tool.SonicRespException;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 import javax.imageio.stream.FileImageOutputStream;
 import java.io.File;
@@ -67,30 +67,49 @@ public class AndroidWSServer implements IAndroidWSServer {
     private String key;
     @Value("${sonic.agent.port}")
     private int port;
-    @Autowired
-    private AgentManagerTool agentManagerTool;
 
     @OnOpen
     public void onOpen(Session session, @PathParam("key") String secretKey,
-                       @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
+                    @PathParam("udId") String udId, @PathParam("token") String token) throws Exception {
+        log.info("Android control websocket opening: udId={}, session={}", udId, session.getId());
         if (secretKey.length() == 0 || (!secretKey.equals(key)) || token.length() == 0) {
-            log.info("Auth Failed!");
+            log.info("Android control websocket auth failed: udId={}, session={}", udId, session.getId());
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
 
+        log.info("Android control websocket waiting for device lock: udId={}, session={}", udId, session.getId());
         boolean lockSuccess = DevicesLockMap.lockByUdId(udId, 30L, TimeUnit.SECONDS);
         if (!lockSuccess) {
-            log.info("Fail to get device lock... please make sure device is not busy.");
+            log.info("Android control websocket failed to get device lock: udId={}, session={}", udId, session.getId());
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
-        log.info("android lock udId：{}", udId);
+        log.info("Android control websocket locked device: udId={}, session={}", udId, session.getId());
+        // 获取锁成功后立即写入 udId，确保 onClose 时能正确解锁
+        // 这必须在任何可能 return 的代码之前执行！
+        session.getUserProperties().put("udId", udId);
         AndroidDeviceLocalStatus.startDebug(udId);
 
+        log.info("Android control websocket locating device: udId={}, session={}", udId, session.getId());
         IDevice iDevice = AndroidDeviceBridgeTool.getIDeviceByUdId(udId);
         if (iDevice == null) {
-            log.info("Target device is not connecting, please check the connection.");
+            log.info("Android control websocket target device is not connecting: udId={}, session={}", udId, session.getId());
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
+        // Proactively wake screen up before starting Sonic services.
+        // This helps reduce intermittent UIAutomator2 timeouts on some ROMs when screen is off/locked.
+        AndroidDeviceBridgeTool.wakeUpScreen(iDevice);
 
         session.getUserProperties().put("udId", udId);
         session.getUserProperties().put("id", String.format("%s-%s", this.getClass().getSimpleName(), udId));
@@ -119,13 +138,21 @@ public class AndroidWSServer implements IAndroidWSServer {
 
         AndroidAPKMap.getMap().put(udId, false);
 
+        log.info("Android control websocket installing Sonic APK: udId={}, serialNumber={}", udId, iDevice.getSerialNumber());
         if (!AndroidDeviceBridgeTool.installSonicApk(iDevice)) {
+            log.warn("Android control websocket install Sonic APK failed: udId={}, serialNumber={}", udId, iDevice.getSerialNumber());
             AndroidAPKMap.getMap().remove(udId);
+            try {
+                session.close();
+            } catch (Exception ignored) {
+            }
             return;
         }
 
-        AndroidDeviceBridgeTool.executeCommand(iDevice, "am start -n org.cloud.sonic.android/.SonicServiceActivity");
+        log.info("Android control websocket starting Sonic service activity: udId={}, serialNumber={}", udId, iDevice.getSerialNumber());
+        AndroidDeviceBridgeTool.executeCommand(iDevice, "am start -n org.cloud.sonic.android/.SonicServiceActivity", 5000, TimeUnit.MILLISECONDS);
         AndroidAPKMap.getMap().put(udId, true);
+        log.info("Android control websocket Sonic APK ready: udId={}, serialNumber={}", udId, iDevice.getSerialNumber());
 
         AndroidTouchHandler.startTouch(iDevice);
 
@@ -133,10 +160,10 @@ public class AndroidWSServer implements IAndroidWSServer {
 
         openDriver(iDevice, session);
 
-        String currentIme = AndroidDeviceBridgeTool.executeCommand(iDevice, "settings get secure default_input_method");
+        String currentIme = AndroidDeviceBridgeTool.executeCommand(iDevice, "settings get secure default_input_method", 5000, TimeUnit.MILLISECONDS);
         if (!currentIme.contains("org.cloud.sonic.android/.keyboard.SonicKeyboard")) {
-            AndroidDeviceBridgeTool.executeCommand(iDevice, "ime enable org.cloud.sonic.android/.keyboard.SonicKeyboard");
-            AndroidDeviceBridgeTool.executeCommand(iDevice, "ime set org.cloud.sonic.android/.keyboard.SonicKeyboard");
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "ime enable org.cloud.sonic.android/.keyboard.SonicKeyboard", 5000, TimeUnit.MILLISECONDS);
+            AndroidDeviceBridgeTool.executeCommand(iDevice, "ime set org.cloud.sonic.android/.keyboard.SonicKeyboard", 5000, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -146,14 +173,21 @@ public class AndroidWSServer implements IAndroidWSServer {
         try {
             exit(session);
         } finally {
-            DevicesLockMap.unlockAndRemoveByUdId(udId);
-            log.info("android unlock udId：{}", udId);
+            if (StringUtils.hasText(udId)) {
+                DevicesLockMap.unlockAndRemoveByUdId(udId);
+                log.info("android unlock udId：{}", udId);
+            } else {
+                // 如果 onOpen 在鉴权/锁/设备检查阶段提前 return，可能没有写入 udId，onClose 仍会被触发
+                log.warn("android unlock skipped: udId is blank, session={}", session.getId());
+            }
         }
     }
 
     @OnError
     public void onError(Session session, Throwable error) {
-        log.info(error.fillInStackTrace().toString());
+        Object idObj = session == null ? null : session.getUserProperties().get("id");
+        log.error("Android control websocket error: session={}",
+                idObj == null ? (session == null ? "null" : session.getId()) : idObj.toString(), error);
         JSONObject errMsg = new JSONObject();
         errMsg.put("msg", "error");
         BytesTool.sendText(session, errMsg.toJSONString());
@@ -164,10 +198,12 @@ public class AndroidWSServer implements IAndroidWSServer {
         JSONObject msg = JSON.parseObject(message);
         log.info("{} send: {}", session.getUserProperties().get("id").toString(), msg);
         IDevice iDevice = udIdMap.get(session);
+        // 获取稳定的 udId（WiFi 设备只使用 IP 部分）
+        String udId = (String) session.getUserProperties().get("udId");
         switch (msg.getString("type")) {
             case "startPerfmon" ->
-                    AndroidSupplyTool.startPerfmon(iDevice.getSerialNumber(), msg.getString("bundleId"), session, null, 1000);
-            case "stopPerfmon" -> AndroidSupplyTool.stopPerfmon(iDevice.getSerialNumber());
+                    AndroidSupplyTool.startPerfmon(udId, msg.getString("bundleId"), session, null, 1000);
+            case "stopPerfmon" -> AndroidSupplyTool.stopPerfmon(udId);
             case "startKeyboard" -> {
                 String currentIme = AndroidDeviceBridgeTool.executeCommand(iDevice, "settings get secure default_input_method");
                 if (!currentIme.contains("org.cloud.sonic.android/.keyboard.SonicKeyboard")) {
@@ -191,7 +227,7 @@ public class AndroidWSServer implements IAndroidWSServer {
                 Socket webPortSocket = PortTool.getBindSocket();
                 int pPort = PortTool.releaseAndGetPort(portSocket);
                 int webPort = PortTool.releaseAndGetPort(webPortSocket);
-                SGMTool.startProxy(iDevice.getSerialNumber(), SGMTool.getCommand(pPort, webPort));
+                SGMTool.startProxy(udId, SGMTool.getCommand(pPort, webPort));
                 AndroidDeviceBridgeTool.startProxy(iDevice, getHost(), pPort);
                 JSONObject proxy = new JSONObject();
                 proxy.put("webPort", webPort);
@@ -227,7 +263,7 @@ public class AndroidWSServer implements IAndroidWSServer {
             }
             case "scan" -> AndroidDeviceBridgeTool.pushToCamera(iDevice, msg.getString("url"));
             case "text" -> AndroidDeviceBridgeTool.sendKeysByKeyboard(iDevice, msg.getString("detail"));
-            case "touch" -> AndroidTouchHandler.writeToOutputStream(iDevice, msg.getString("detail"));
+            case "touch" -> AndroidTouchHandler.writeScreenTouchToOutputStream(iDevice, msg.getString("detail"));
             case "keyEvent" -> AndroidDeviceBridgeTool.pressKey(iDevice, msg.getInteger("detail"));
             case "pullFile" -> {
                 JSONObject result = new JSONObject();
@@ -256,7 +292,7 @@ public class AndroidWSServer implements IAndroidWSServer {
                 BytesTool.sendText(session, result.toJSONString());
             }
             case "debug" -> {
-                AndroidStepHandler androidStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
+                AndroidStepHandler androidStepHandler = HandlerMap.getAndroidMap().get(udId);
                 switch (msg.getString("detail")) {
                     case "poco" -> AndroidDeviceThreadPool.cachedThreadPool.execute(() -> {
                         androidStepHandler.startPocoDriver(new HandleContext(), msg.getString("engine"), msg.getInteger("port"));
@@ -275,7 +311,7 @@ public class AndroidWSServer implements IAndroidWSServer {
                         JSONObject jsonDebug = new JSONObject();
                         jsonDebug.put("msg", "findSteps");
                         jsonDebug.put("key", key);
-                        jsonDebug.put("udId", iDevice.getSerialNumber());
+                        jsonDebug.put("udId", udId);
                         jsonDebug.put("pwd", msg.getString("pwd"));
                         jsonDebug.put("sessionId", session.getUserProperties().get("id").toString());
                         jsonDebug.put("caseId", msg.getInteger("caseId"));
@@ -337,29 +373,72 @@ public class AndroidWSServer implements IAndroidWSServer {
                     case "closeDriver" -> {
                         if (androidStepHandler != null && androidStepHandler.getAndroidDriver() != null) {
                             androidStepHandler.closeAndroidDriver();
-                            HandlerMap.getAndroidMap().remove(iDevice.getSerialNumber());
+                            HandlerMap.getAndroidMap().remove(udId);
                         }
                     }
                     case "tree" -> {
                         if (androidStepHandler != null && androidStepHandler.getAndroidDriver() != null) {
                             AndroidDeviceThreadPool.cachedThreadPool.execute(() -> {
-                                try {
-                                    JSONObject result = new JSONObject();
-                                    JSONObject settings = new JSONObject();
-                                    settings.put("enableMultiWindows", msg.getBoolean("isMulti") != null && msg.getBoolean("isMulti"));
-                                    settings.put("ignoreUnimportantViews", msg.getBoolean("isIgnore") != null && msg.getBoolean("isIgnore"));
-                                    settings.put("allowInvisibleElements", msg.getBoolean("isVisible") != null && msg.getBoolean("isVisible"));
-                                    androidStepHandler.getAndroidDriver().setAppiumSettings(settings);
-                                    result.put("msg", "tree");
-                                    result.put("detail", androidStepHandler.getResource());
-                                    result.put("webView", androidStepHandler.getWebView());
-                                    result.put("activity", AndroidDeviceBridgeTool.getCurrentActivity(iDevice));
-                                    BytesTool.sendText(session, result.toJSONString());
-                                } catch (Throwable e) {
-                                    log.error(e.getMessage());
-                                    JSONObject result = new JSONObject();
-                                    result.put("msg", "treeFail");
-                                    BytesTool.sendText(session, result.toJSONString());
+                                long startTime = System.currentTimeMillis();
+                                int maxRetry = 2;
+                                for (int retry = 0; retry <= maxRetry; retry++) {
+                                    try {
+                                        if (retry > 0) {
+                                            log.info("Retrying UI tree fetch for {} (attempt {})", iDevice.getSerialNumber(), retry + 1);
+                                            // Try to reconnect UIAutomator2 if connection was lost
+                                            try {
+                                                Integer uiaPort = (Integer) session.getUserProperties().get("uiaPort");
+                                                if (uiaPort != null) {
+                                                    log.info("Attempting to restart UIAutomator2 connection for {}", iDevice.getSerialNumber());
+                                                    androidStepHandler.closeAndroidDriver();
+                                                    Thread.sleep(1000);
+                                                    AndroidDeviceBridgeTool.startUiaServer(iDevice, uiaPort);
+                                                    androidStepHandler.startAndroidDriver(iDevice, uiaPort);
+                                                    log.info("UIAutomator2 reconnected successfully for {}", iDevice.getSerialNumber());
+                                                }
+                                            } catch (Exception reconnectEx) {
+                                                log.warn("Failed to reconnect UIAutomator2 for {}: {}", iDevice.getSerialNumber(), reconnectEx.getMessage());
+                                            }
+                                        }
+
+                                        log.info("Start fetching UI tree for {}", iDevice.getSerialNumber());
+                                        JSONObject result = new JSONObject();
+                                        JSONObject settings = new JSONObject();
+                                        settings.put("enableMultiWindows", msg.getBoolean("isMulti") != null && msg.getBoolean("isMulti"));
+                                        settings.put("ignoreUnimportantViews", msg.getBoolean("isIgnore") != null && msg.getBoolean("isIgnore"));
+                                        settings.put("allowInvisibleElements", msg.getBoolean("isVisible") != null && msg.getBoolean("isVisible"));
+                                        log.info("Setting Appium settings for {}: {}", iDevice.getSerialNumber(), settings);
+                                        androidStepHandler.getAndroidDriver().setAppiumSettings(settings);
+                                        log.info("Calling getPageSource for {}...", iDevice.getSerialNumber());
+                                        result.put("msg", "tree");
+                                        result.put("detail", androidStepHandler.getResource());
+                                        long elapsed = System.currentTimeMillis() - startTime;
+                                        log.info("getPageSource completed for {} in {}ms", iDevice.getSerialNumber(), elapsed);
+                                        result.put("webView", androidStepHandler.getWebView());
+                                        result.put("activity", AndroidDeviceBridgeTool.getCurrentActivity(iDevice));
+                                        BytesTool.sendText(session, result.toJSONString());
+                                        return; // Success, exit retry loop
+                                    } catch (Throwable e) {
+                                        long elapsed = System.currentTimeMillis() - startTime;
+                                        String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getName();
+                                        // Check if it's a connection error that might be recoverable
+                                        boolean isConnectionError = errorMsg.contains("Unexpected end of file")
+                                            || errorMsg.contains("Connection refused")
+                                            || errorMsg.contains("Read timed out")
+                                            || errorMsg.contains("SocketException");
+
+                                        if (isConnectionError && retry < maxRetry) {
+                                            log.warn("getPageSource failed for {} (connection error), will retry: {}", iDevice.getSerialNumber(), errorMsg);
+                                            try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                                            continue; // Retry
+                                        }
+
+                                        log.error("getPageSource failed for {} after {}ms: {}", iDevice.getSerialNumber(), elapsed, errorMsg);
+                                        JSONObject result = new JSONObject();
+                                        result.put("msg", "treeFail");
+                                        BytesTool.sendText(session, result.toJSONString());
+                                        return;
+                                    }
                                 }
                             });
                         }
@@ -395,7 +474,7 @@ public class AndroidWSServer implements IAndroidWSServer {
                         JSONObject jsonCheck = new JSONObject();
                         jsonCheck.put("msg", "generateStep");
                         jsonCheck.put("key", key);
-                        jsonCheck.put("udId", iDevice.getSerialNumber());
+                        jsonCheck.put("udId", udId);
                         jsonCheck.put("pwd", msg.getString("pwd"));
                         jsonCheck.put("sessionId", session.getUserProperties().get("id").toString());
                         jsonCheck.put("element", msg.getString("element"));
@@ -410,24 +489,33 @@ public class AndroidWSServer implements IAndroidWSServer {
 
     private void openDriver(IDevice iDevice, Session session) {
         synchronized (session) {
+            // 获取稳定的 udId
+            String udId = (String) session.getUserProperties().get("udId");
             AndroidStepHandler androidStepHandler = new AndroidStepHandler();
-            androidStepHandler.setTestMode(0, 0, iDevice.getSerialNumber(), DeviceStatus.DEBUGGING, session.getUserProperties().get("id").toString());
+            androidStepHandler.setTestMode(0, 0, udId, DeviceStatus.DEBUGGING, session.getUserProperties().get("id").toString());
             JSONObject result = new JSONObject();
             AndroidDeviceThreadPool.cachedThreadPool.execute(() -> {
                 try {
-                    AndroidDeviceLocalStatus.startDebug(iDevice.getSerialNumber());
+                    AndroidDeviceLocalStatus.startDebug(udId);
                     int port = AndroidDeviceBridgeTool.startUiaServer(iDevice);
+                    // record for cleanup
+                    session.getUserProperties().put("uiaPort", port);
                     androidStepHandler.startAndroidDriver(iDevice, port);
                     result.put("status", "success");
                     result.put("port", port);
-                    HandlerMap.getAndroidMap().put(iDevice.getSerialNumber(), androidStepHandler);
+                    HandlerMap.getAndroidMap().put(udId, androidStepHandler);
                 } catch (Exception e) {
                     log.error(e.getMessage());
                     result.put("status", "error");
                     androidStepHandler.closeAndroidDriver();
                 } finally {
                     result.put("msg", "openDriver");
-                    BytesTool.sendText(session, result.toJSONString());
+                    try {
+                        if (session != null && session.isOpen()) {
+                            BytesTool.sendText(session, result.toJSONString());
+                        }
+                    } catch (Exception ignored) {
+                    }
                 }
             });
         }
@@ -436,27 +524,42 @@ public class AndroidWSServer implements IAndroidWSServer {
     private void exit(Session session) {
         synchronized (session) {
             ScheduledFuture<?> future = (ScheduledFuture<?>) session.getUserProperties().get("schedule");
-            future.cancel(true);
-            AndroidDeviceLocalStatus.finish(session.getUserProperties().get("udId") + "");
+            if (future != null) {
+                future.cancel(true);
+            }
+            // 获取稳定的 udId
+            String udId = (String) session.getUserProperties().get("udId");
+            AndroidDeviceLocalStatus.finish(udId);
             IDevice iDevice = udIdMap.get(session);
             try {
-                AndroidStepHandler androidStepHandler = HandlerMap.getAndroidMap().get(iDevice.getSerialNumber());
-                if (androidStepHandler != null) {
-                    androidStepHandler.closeAndroidDriver();
+                if (iDevice != null) {
+                    AndroidStepHandler androidStepHandler = HandlerMap.getAndroidMap().get(udId);
+                    if (androidStepHandler != null) {
+                        androidStepHandler.closeAndroidDriver();
+                    }
                 }
             } catch (Exception e) {
                 log.info("close driver failed.");
             } finally {
-                HandlerMap.getAndroidMap().remove(iDevice.getSerialNumber());
+                // 无论 iDevice 是否为空，都要清理 HandlerMap，防止内存泄漏
+                if (udId != null) {
+                    HandlerMap.getAndroidMap().remove(udId);
+                }
             }
-            if (iDevice != null) {
+            if (iDevice != null && udId != null) {
                 AndroidDeviceBridgeTool.clearProxy(iDevice);
                 AndroidDeviceBridgeTool.clearWebView(iDevice);
-                AndroidSupplyTool.stopShare(iDevice.getSerialNumber());
-                AndroidSupplyTool.stopPerfmon(iDevice.getSerialNumber());
-                SGMTool.stopProxy(iDevice.getSerialNumber());
-                AndroidAPKMap.getMap().remove(iDevice.getSerialNumber());
+                AndroidSupplyTool.stopShare(udId);
+                AndroidSupplyTool.stopPerfmon(udId);
+                SGMTool.stopProxy(udId);
+                AndroidAPKMap.getMap().remove(udId);
                 AndroidTouchHandler.stopTouch(iDevice);
+
+                // cleanup UIAutomator2 port forward if we recorded it
+                Object uiaPortObj = session.getUserProperties().get("uiaPort");
+                if (uiaPortObj instanceof Integer) {
+                    AndroidDeviceBridgeTool.removeForward(iDevice, (Integer) uiaPortObj, 6790);
+                }
             }
             removeUdIdMapAndSet(session);
             WebSocketSessionMap.removeSession(session);
@@ -465,9 +568,13 @@ public class AndroidWSServer implements IAndroidWSServer {
             } catch (IOException e) {
                 e.printStackTrace();
             }
-            log.info("{} : quit.", session.getUserProperties().get("id").toString());
-            if (AndroidDeviceBridgeTool.getOrientation(iDevice) != 0) {
-                AndroidDeviceBridgeTool.pressKey(iDevice, AndroidKey.HOME);
+            Object id = session.getUserProperties().get("id");
+            log.info("{} : quit.", id == null ? session.getId() : id.toString());
+            try {
+                if (iDevice != null && AndroidDeviceBridgeTool.getOrientation(iDevice) != 0) {
+                    AndroidDeviceBridgeTool.pressKey(iDevice, AndroidKey.HOME);
+                }
+            } catch (Exception ignored) {
             }
         }
     }

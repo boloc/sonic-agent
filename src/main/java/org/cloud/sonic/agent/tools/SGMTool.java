@@ -46,11 +46,8 @@ public class SGMTool {
 
     public static void startProxy(String udId, String command) {
         String processName = String.format("process-%s-proxy", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止旧进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
         String system = System.getProperty("os.name").toLowerCase();
         Process ps = null;
         try {
@@ -59,10 +56,14 @@ public class SGMTool {
             } else if (system.contains("linux") || system.contains("mac")) {
                 ps = Runtime.getRuntime().exec(new String[]{"sh", "-c", command});
             }
+            if (ps == null) {
+                log.info("{} web proxy start failed!", udId);
+                return;
+            }
             InputStreamReader inputStreamReader = new InputStreamReader(ps.getInputStream());
             BufferedReader stdInput = new BufferedReader(inputStreamReader);
             Semaphore isFinish = new Semaphore(0);
-            new Thread(() -> {
+            Thread readerThread = new Thread(() -> {
                 String s;
                 while (true) {
                     try {
@@ -90,17 +91,25 @@ public class SGMTool {
                     e.printStackTrace();
                 }
                 log.info("{} web proxy done.", udId);
-            }).start();
+            });
+            readerThread.setDaemon(true);
+            readerThread.start();
             int wait = 0;
             while (!isFinish.tryAcquire()) {
                 try {
                     Thread.sleep(500);
                 } catch (InterruptedException ex) {
-                    throw new RuntimeException(ex);
+                    Thread.currentThread().interrupt();
+                    log.info(ex.getMessage());
+                    try { stdInput.close(); } catch (IOException ignored) {}
+                    try { inputStreamReader.close(); } catch (IOException ignored) {}
+                    return;
                 }
                 wait++;
                 if (wait >= 120) {
                     log.info("{} web proxy start timeout!", udId);
+                    try { stdInput.close(); } catch (IOException ignored) {}
+                    try { inputStreamReader.close(); } catch (IOException ignored) {}
                     return;
                 }
             }
@@ -112,10 +121,7 @@ public class SGMTool {
 
     public static void stopProxy(String udId) {
         String processName = String.format("process-%s-proxy", udId);
-        if (GlobalProcessMap.getMap().get(processName) != null) {
-            Process ps = GlobalProcessMap.getMap().get(processName);
-            ps.children().forEach(ProcessHandle::destroy);
-            ps.destroy();
-        }
+        // 使用辅助方法终止进程并从 Map 中移除，防止内存泄漏
+        GlobalProcessMap.terminateAndRemove(processName);
     }
 }

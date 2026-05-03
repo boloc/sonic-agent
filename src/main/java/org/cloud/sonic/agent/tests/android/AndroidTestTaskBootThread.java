@@ -22,14 +22,17 @@ import com.android.ddmlib.IDevice;
 import org.cloud.sonic.agent.bridge.android.AndroidDeviceBridgeTool;
 import org.cloud.sonic.agent.bridge.android.AndroidDeviceLocalStatus;
 import org.cloud.sonic.agent.common.interfaces.ResultDetailStatus;
+import org.cloud.sonic.agent.common.interfaces.StepType;
 import org.cloud.sonic.agent.tests.TaskManager;
 import org.cloud.sonic.agent.tests.handlers.AndroidMonitorHandler;
 import org.cloud.sonic.agent.tests.handlers.AndroidStepHandler;
 import org.cloud.sonic.agent.tests.handlers.AndroidTouchHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.StringUtils;
 
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * android启动各个子任务的线程
@@ -45,6 +48,13 @@ public class AndroidTestTaskBootThread extends Thread {
      * android-test-task-boot-{resultId}-{caseId}-{udid}
      */
     public final static String ANDROID_TEST_TASK_BOOT_PRE = "android-test-task-boot-%s-%s-%s";
+
+    private static final long DEFAULT_TASK_TIMEOUT_MINUTES = 60;
+    private static final long DEFAULT_TASK_IDLE_TIMEOUT_MINUTES = 15;
+    private static final String TASK_TIMEOUT_PROPERTY = "sonic.test.task.maxMinutes";
+    private static final String TASK_TIMEOUT_ENV = "SONIC_TEST_TASK_MAX_MINUTES";
+    private static final String TASK_IDLE_TIMEOUT_PROPERTY = "sonic.test.task.idleMaxMinutes";
+    private static final String TASK_IDLE_TIMEOUT_ENV = "SONIC_TEST_TASK_IDLE_MAX_MINUTES";
 
     /**
      * 判断线程是否结束
@@ -179,10 +189,62 @@ public class AndroidTestTaskBootThread extends Thread {
         return forceStop;
     }
 
+    private long getTaskTimeoutMs() {
+        return getConfiguredTimeoutMs(TASK_TIMEOUT_PROPERTY, TASK_TIMEOUT_ENV, DEFAULT_TASK_TIMEOUT_MINUTES);
+    }
+
+    private long getTaskIdleTimeoutMs() {
+        return getConfiguredTimeoutMs(TASK_IDLE_TIMEOUT_PROPERTY, TASK_IDLE_TIMEOUT_ENV, DEFAULT_TASK_IDLE_TIMEOUT_MINUTES);
+    }
+
+    private long getConfiguredTimeoutMs(String property, String env, long defaultMinutes) {
+        String configured = System.getProperty(property);
+        if (!StringUtils.hasText(configured)) {
+            configured = System.getenv(env);
+        }
+        if (!StringUtils.hasText(configured)) {
+            return TimeUnit.MINUTES.toMillis(defaultMinutes);
+        }
+        try {
+            long minutes = Long.parseLong(configured.trim());
+            if (minutes <= 0) {
+                return 0L;
+            }
+            return TimeUnit.MINUTES.toMillis(minutes);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid task timeout config {}={}, fallback to {} minutes.",
+                    property, configured, defaultMinutes);
+            return TimeUnit.MINUTES.toMillis(defaultMinutes);
+        }
+    }
+
+    private void stopChildThreadsForTimeout(long timeoutMs, String reason) {
+        long timeoutMinutes = TimeUnit.MILLISECONDS.toMinutes(timeoutMs);
+        log.warn("Android task {} after {} minutes, stopping child threads. device={}, rid={}, cid={}",
+                reason, timeoutMinutes, udId, resultId, caseId);
+        androidStepHandler.setResultDetailStatus(ResultDetailStatus.FAIL);
+        androidStepHandler.getLog().sendStepLog(
+                StepType.ERROR,
+                "Task timeout",
+                "Task " + reason + " for " + timeoutMinutes + " minutes and was stopped by agent watchdog."
+        );
+        if (runStepThread != null) {
+            runStepThread.setStopped(true);
+            runStepThread.interrupt();
+        }
+        if (recordThread != null) {
+            recordThread.interrupt();
+        }
+        if (perfDataThread != null) {
+            perfDataThread.interrupt();
+        }
+    }
+
     @Override
     public void run() {
 
         boolean startTestSuccess = false;
+        boolean statusSent = false;
         IDevice iDevice = AndroidDeviceBridgeTool.getIDeviceByUdId(udId);
         AndroidMonitorHandler androidMonitorHandler = new AndroidMonitorHandler();
 
@@ -201,7 +263,36 @@ public class AndroidTestTaskBootThread extends Thread {
 
             startTestSuccess = true;
             try {
-                int port = AndroidDeviceBridgeTool.startUiaServer(iDevice);
+                // 定时任务执行前主动唤醒屏幕，防止高版本 Android 因屏幕关闭导致 UIAutomator2 超时
+                AndroidDeviceBridgeTool.wakeUpScreen(iDevice);
+                Thread.sleep(1000); // 等待屏幕完全唤醒
+
+                // Android 15/部分 ROM 的锁屏界面可能无法被 UIAutomator2 正常操作（层级不可见/请求卡住）
+                // 注意：默认不在这里“抢跑解锁”，避免影响用户在步骤里编排的“解锁流程”。
+                // 如需在启动 UIA2 前强制解锁，请在 gp 中设置 autoUnlockBeforeUia=true，并提供 PIN（纯数字）。
+                String unlockPin = null;
+                boolean autoUnlockBeforeUia = false;
+                try {
+                    unlockPin = jsonObject.getString("pwd");
+                } catch (Exception ignored) {
+                }
+                if (!StringUtils.hasText(unlockPin)) {
+                    try {
+                        JSONObject gp = jsonObject.getJSONObject("gp");
+                        if (gp != null) {
+                            unlockPin = gp.getString("deviceUnlockPin");
+                            if (!StringUtils.hasText(unlockPin)) unlockPin = gp.getString("unlockPin");
+                            if (!StringUtils.hasText(unlockPin)) unlockPin = gp.getString("pin");
+                            autoUnlockBeforeUia = Boolean.TRUE.equals(gp.getBoolean("autoUnlockBeforeUia"));
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (autoUnlockBeforeUia && StringUtils.hasText(unlockPin)) {
+                    AndroidDeviceBridgeTool.unlockByPinIfLocked(iDevice, unlockPin);
+                }
+                
+                int port = AndroidDeviceBridgeTool.startUiaServerWithRetry(iDevice);
                 if (!AndroidDeviceBridgeTool.installSonicApk(iDevice)) {
                     AndroidTouchHandler.switchTouchMode(iDevice, AndroidTouchHandler.TouchMode.ADB);
                 } else {
@@ -211,7 +302,11 @@ public class AndroidTestTaskBootThread extends Thread {
                 }
                 androidStepHandler.startAndroidDriver(iDevice, port);
             } catch (Exception e) {
-                log.error(e.getMessage());
+                log.error("Android test bootstrap failed, task will finish immediately. device={}, rid={}, cid={}",
+                        udId, resultId, caseId, e);
+                androidStepHandler.setResultDetailStatus(ResultDetailStatus.FAIL);
+                androidStepHandler.sendStatus();
+                statusSent = true;
                 androidStepHandler.closeAndroidDriver();
                 androidMonitorHandler.stopMonitor(iDevice);
                 AndroidTouchHandler.stopTouch(iDevice);
@@ -238,7 +333,19 @@ public class AndroidTestTaskBootThread extends Thread {
 
 
             //等待两个线程结束了才结束方法
+            long taskTimeoutMs = getTaskTimeoutMs();
+            long taskIdleTimeoutMs = getTaskIdleTimeoutMs();
+            long taskStartMs = System.currentTimeMillis();
             while ((recordThread.isAlive()) || (runStepThread.isAlive())) {
+                long now = System.currentTimeMillis();
+                if (taskTimeoutMs > 0 && now - taskStartMs >= taskTimeoutMs) {
+                    stopChildThreadsForTimeout(taskTimeoutMs, "exceeded total timeout");
+                    break;
+                }
+                if (taskIdleTimeoutMs > 0 && now - androidStepHandler.getLog().getLastSendTimeMs() >= taskIdleTimeoutMs) {
+                    stopChildThreadsForTimeout(taskIdleTimeoutMs, "had no progress");
+                    break;
+                }
                 Thread.sleep(1000);
             }
         } catch (InterruptedException e) {
@@ -252,7 +359,9 @@ public class AndroidTestTaskBootThread extends Thread {
                 androidMonitorHandler.stopMonitor(iDevice);
                 AndroidTouchHandler.stopTouch(iDevice);
             }
-            androidStepHandler.sendStatus();
+            if (!statusSent) {
+                androidStepHandler.sendStatus();
+            }
             finished.release();
             TaskManager.clearTerminatedThreadByKey(this.getName());
         }

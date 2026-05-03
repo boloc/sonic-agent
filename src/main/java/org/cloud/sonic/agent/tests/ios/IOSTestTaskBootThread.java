@@ -21,12 +21,15 @@ import com.alibaba.fastjson.JSONObject;
 import org.cloud.sonic.agent.bridge.ios.IOSDeviceLocalStatus;
 import org.cloud.sonic.agent.bridge.ios.SibTool;
 import org.cloud.sonic.agent.common.interfaces.ResultDetailStatus;
+import org.cloud.sonic.agent.common.interfaces.StepType;
 import org.cloud.sonic.agent.tests.TaskManager;
 import org.cloud.sonic.agent.tests.handlers.IOSStepHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.StringUtils;
 
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 public class IOSTestTaskBootThread extends Thread {
 
@@ -36,6 +39,13 @@ public class IOSTestTaskBootThread extends Thread {
      * ios-test-task-boot-{resultId}-{caseId}-{udid}
      */
     public final static String IOS_TEST_TASK_BOOT_PRE = "ios-test-task-boot-%s-%s-%s";
+
+    private static final long DEFAULT_TASK_TIMEOUT_MINUTES = 60;
+    private static final long DEFAULT_TASK_IDLE_TIMEOUT_MINUTES = 15;
+    private static final String TASK_TIMEOUT_PROPERTY = "sonic.test.task.maxMinutes";
+    private static final String TASK_TIMEOUT_ENV = "SONIC_TEST_TASK_MAX_MINUTES";
+    private static final String TASK_IDLE_TIMEOUT_PROPERTY = "sonic.test.task.idleMaxMinutes";
+    private static final String TASK_IDLE_TIMEOUT_ENV = "SONIC_TEST_TASK_IDLE_MAX_MINUTES";
 
     /**
      * 判断线程是否结束
@@ -158,6 +168,57 @@ public class IOSTestTaskBootThread extends Thread {
         return forceStop;
     }
 
+    private long getTaskTimeoutMs() {
+        return getConfiguredTimeoutMs(TASK_TIMEOUT_PROPERTY, TASK_TIMEOUT_ENV, DEFAULT_TASK_TIMEOUT_MINUTES);
+    }
+
+    private long getTaskIdleTimeoutMs() {
+        return getConfiguredTimeoutMs(TASK_IDLE_TIMEOUT_PROPERTY, TASK_IDLE_TIMEOUT_ENV, DEFAULT_TASK_IDLE_TIMEOUT_MINUTES);
+    }
+
+    private long getConfiguredTimeoutMs(String property, String env, long defaultMinutes) {
+        String configured = System.getProperty(property);
+        if (!StringUtils.hasText(configured)) {
+            configured = System.getenv(env);
+        }
+        if (!StringUtils.hasText(configured)) {
+            return TimeUnit.MINUTES.toMillis(defaultMinutes);
+        }
+        try {
+            long minutes = Long.parseLong(configured.trim());
+            if (minutes <= 0) {
+                return 0L;
+            }
+            return TimeUnit.MINUTES.toMillis(minutes);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid task timeout config {}={}, fallback to {} minutes.",
+                    property, configured, defaultMinutes);
+            return TimeUnit.MINUTES.toMillis(defaultMinutes);
+        }
+    }
+
+    private void stopChildThreadsForTimeout(long timeoutMs, String reason) {
+        long timeoutMinutes = TimeUnit.MILLISECONDS.toMinutes(timeoutMs);
+        log.warn("iOS task {} after {} minutes, stopping child threads. device={}, rid={}, cid={}",
+                reason, timeoutMinutes, udId, resultId, caseId);
+        iosStepHandler.setResultDetailStatus(ResultDetailStatus.FAIL);
+        iosStepHandler.getLog().sendStepLog(
+                StepType.ERROR,
+                "Task timeout",
+                "Task " + reason + " for " + timeoutMinutes + " minutes and was stopped by agent watchdog."
+        );
+        if (runStepThread != null) {
+            runStepThread.setStopped(true);
+            runStepThread.interrupt();
+        }
+        if (recordThread != null) {
+            recordThread.interrupt();
+        }
+        if (perfDataThread != null) {
+            perfDataThread.interrupt();
+        }
+    }
+
     @Override
     public void run() {
 
@@ -205,7 +266,19 @@ public class IOSTestTaskBootThread extends Thread {
 
 
             //等待两个线程结束了才结束方法
+            long taskTimeoutMs = getTaskTimeoutMs();
+            long taskIdleTimeoutMs = getTaskIdleTimeoutMs();
+            long taskStartMs = System.currentTimeMillis();
             while ((recordThread.isAlive()) || (runStepThread.isAlive())) {
+                long now = System.currentTimeMillis();
+                if (taskTimeoutMs > 0 && now - taskStartMs >= taskTimeoutMs) {
+                    stopChildThreadsForTimeout(taskTimeoutMs, "exceeded total timeout");
+                    break;
+                }
+                if (taskIdleTimeoutMs > 0 && now - iosStepHandler.getLog().getLastSendTimeMs() >= taskIdleTimeoutMs) {
+                    stopChildThreadsForTimeout(taskIdleTimeoutMs, "had no progress");
+                    break;
+                }
                 Thread.sleep(1000);
             }
         } catch (InterruptedException e) {
